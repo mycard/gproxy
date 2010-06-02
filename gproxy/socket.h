@@ -145,7 +145,6 @@ public:
 	virtual void Reset( );
 	virtual bool GetConnected( )				{ return m_Connected; }
 	virtual string *GetBytes( )					{ return &m_RecvBuffer; }
-	virtual void SetBytes( string buf )         { m_RecvBuffer = buf;}
 	virtual void PutBytes( string bytes );
 	virtual void PutBytes( BYTEARRAY bytes );
 	virtual void ClearRecvBuffer( )				{ m_RecvBuffer.clear( ); }

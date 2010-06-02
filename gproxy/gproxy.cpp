@@ -312,7 +312,7 @@ void DEBUG_Print(string message)
 }
 CGProxy :: CGProxy( string nServer, uint16_t nPort )
 {
-	m_Version = "1.0 (WC3 GUI mod version 1.25)";
+	m_Version = "1.0 Custom build Version 2.0";
 	m_LocalServer = new CTCPServer( );
 	m_LocalSocket = NULL;
 	
@@ -1525,11 +1525,6 @@ bool CWC3 :: Update(void *fd, void *send_fd)
 
 	m_RemoteSocket->DoSend( (fd_set *) send_fd );
 	m_LocalSocket->DoSend( (fd_set * ) send_fd );
-	if( m_IsBNFTP)
-	{
-		m_RemoteSocket->ClearRecvBuffer( );
-		m_LocalSocket->ClearRecvBuffer( );
-	}
 	return false;
 }
 void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
@@ -1771,10 +1766,12 @@ void CWC3 :: ExtractWC3Packets( )
 				m_FirstPacket = false;
 				m_IsBNFTP = true;
 			}
+		}
 	}
 	if (m_IsBNFTP)
 	{
 		m_RemoteSocket->PutBytes( Bytes );
+		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
 		return;
 	}
 	 // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
@@ -1812,7 +1809,6 @@ void CWC3 :: ExtractWC3Packets( )
 					return;
 			}
 	}
-	}
 }
 void CWC3 :: ProcessWC3Packets( )
 {
@@ -1849,6 +1845,7 @@ void CWC3 :: ExtractBNETPackets( )
 	if (m_IsBNFTP)
 	{
 		m_LocalSocket->PutBytes( Bytes );
+		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
 		return;
 	}
     // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
