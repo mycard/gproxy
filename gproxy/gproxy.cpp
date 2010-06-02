@@ -235,21 +235,7 @@ int main( int argc, char **argv )
 		}
 		else
 		{
-			{
-				LPSTR * buffer= new LPSTR();
-				// Number of data bytes required for value
-				DWORD nBytes, dwType;
-				if(ERROR_SUCCESS==::RegQueryValueEx(Key, TEXT("Battle.net Gateways"),NULL,&dwType,0,&nBytes))
-				{
-				dwType =REG_MULTI_SZ;
-				// Allocate string buffer
-				
-				// Read string
-				RegQueryValueEx(Key, TEXT("Battle.net Gateways"),NULL,0,(LPBYTE)buffer,&nBytes);
-				}
-				CONSOLE_Print((string)(char *)buffer);
-			}
-			if (RegSetValueEx(Key, TEXT("Battle.net Gateways"),0,REG_MULTI_SZ,(const BYTE *)"makakas",sizeof("makakas")) != ERROR_SUCCESS) 
+			if (RegSetValueEx(Key, TEXT("Battle.net Gateways"),0,REG_MULTI_SZ,(const BYTE *)Value,sizeof(Value)) != ERROR_SUCCESS) 
 			{
 				CONSOLE_Print("[GPROXY] Unable to add the gateway");
 			}
@@ -264,7 +250,7 @@ int main( int argc, char **argv )
 	// initialize gproxy
 
 	gGProxy = new CGProxy( Server, Port);
-	//gGProxy->m_GIndicator = CFG.GetString("game_indicator","[G]");
+	gGProxy->m_GIndicator = GIndicator;
 	Debug = CFG.GetInt("debug",0) == 0 ? false : true;
 	while( 1 )
 	{
@@ -357,7 +343,6 @@ CGProxy :: CGProxy( string nServer, uint16_t nPort )
 	m_LastActionTime = 0;
 	// wc3 gui mod
 	m_WC3Server = new CTCPServer( );
-    m_WC3 = NULL;
 	m_LocalServer->Listen( string( ), m_Port );
 	m_WC3Server->Listen( string( ), 6112 );
 	CONSOLE_Print("[GPROXY] Listening for gproxy games on port ["+UTIL_ToString(m_Port)+"]");
@@ -839,7 +824,6 @@ void CGProxy :: ProcessLocalPackets( )
 					BYTEARRAY Name = UTIL_ExtractCString( Data, 19 );
 					string NameString = string( Name.begin( ), Name.end( ) );
 					BYTEARRAY Remainder = BYTEARRAY( Data.begin( ) + Name.size( ) + 20, Data.end( ) );
-					m_Games = m_WC3->GetGames( );
 					if( Remainder.size( ) == 18 )
 					{
 						// lookup the game in the main list
@@ -1467,8 +1451,8 @@ CWC3 :: CWC3( CTCPSocket *socket, string hostname,uint16_t port,string indicator
 	m_RemoteSocket->Connect( string( ) , hostname, port );
 	CONSOLE_Print("[GPROXY] Initiating the two way connection" );
 	m_GIndicator = indicator;
-	m_FirstPacket = false;
-	m_IsWC3 = true;
+	m_FirstPacket = true;
+	m_IsBNFTP = false;
 }
 CWC3 ::~CWC3( )
 { 
@@ -1509,7 +1493,8 @@ bool CWC3 :: Update(void *fd, void *send_fd)
 	else
 	{
 		m_LocalSocket->DoRecv( (fd_set *)fd );
-		m_TempBuffer.push( m_LocalSocket->GetBytes( ) );
+		ExtractWC3Packets( );
+		ProcessWC3Packets( );
 	}
 
 	// remote socket
@@ -1531,37 +1516,20 @@ bool CWC3 :: Update(void *fd, void *send_fd)
 			CONSOLE_Print("[GPROXY] Remote socket connected with ["+ m_RemoteSocket->GetIPString( ) +"]");
 		}
 	}
-	else
+	if ( m_RemoteSocket->GetConnected( ) )
 	{
 		m_RemoteSocket->DoRecv( (fd_set *)fd);
-	}
-	// process packets
-
-	if ( m_IsWC3 )
-	{
-		ExtractBNETPackets( m_RemoteSocket->GetBytes( ) );
-	}
-	else
-	{
-		m_LocalSocket->PutBytes( *m_RemoteSocket->GetBytes( ) );
+		ExtractBNETPackets( );
+		ProcessBNETPackets( );
 	}
 
-	while ( !m_TempBuffer.empty( ) )
-	{
-		if (m_IsWC3)
-		{
-			ExtractWC3Packets( m_TempBuffer.front( ) );
-		}
-		else
-		{
-			m_RemoteSocket->PutBytes ( *m_TempBuffer.front( ) );
-		}
-		m_TempBuffer.pop( );
-	}
 	m_RemoteSocket->DoSend( (fd_set *) send_fd );
 	m_LocalSocket->DoSend( (fd_set * ) send_fd );
-	m_RemoteSocket->ClearRecvBuffer( );
-	m_LocalSocket->ClearRecvBuffer( );
+	if( m_IsBNFTP)
+	{
+		m_RemoteSocket->ClearRecvBuffer( );
+		m_LocalSocket->ClearRecvBuffer( );
+	}
 	return false;
 }
 void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
@@ -1682,6 +1650,7 @@ void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
 		}
 	}
 	m_Games = Games;
+	gGProxy->m_Games = Games;
 
 	BYTEARRAY packet;
 	packet.push_back(255);
@@ -1778,88 +1747,111 @@ bool CWC3 :: ProcessCommand(string Message)
 
 
 
-void CWC3 :: ExtractWC3Packets( string *RecvBuffer )
+void CWC3 :: ExtractWC3Packets( )
 {
+	string *RecvBuffer = m_LocalSocket->GetBytes( );
 	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
-    if( Bytes.size( ) >= 1)
-    {
-		if( Bytes[0] == 1 )
+	if ( m_FirstPacket )
+	{
+		if( Bytes.size( ) >= 1)
 		{
-				BYTEARRAY packet;
-				packet.push_back(1);
-				m_RemoteSocket->PutBytes(packet);
-				RecvBuffer->substr(1);
-				Bytes = BYTEARRAY( Bytes.begin( ) + 1, Bytes.end( ) );
-				CONSOLE_Print("[GPROXY] Connection marked as WC3");
-				m_IsWC3 = true;
-				m_FirstPacket = true;
-		}
-		if( Bytes[0] == 2 )
-		{
-			m_RemoteSocket->PutBytes( Bytes );
-			CONSOLE_Print("[GPROXY] Connection marked as BNFTP");
-			m_FirstPacket = true;
-			m_IsWC3 = false;
-			m_FirstPacket = true;
-			return;
-		}
+			if( Bytes[0] == 1 )
+			{
+					BYTEARRAY packet;
+					packet.push_back(1);
+					m_RemoteSocket->PutBytes(packet);
+					*RecvBuffer = RecvBuffer->substr( 1 );
+					Bytes = BYTEARRAY( Bytes.begin( ) + 1, Bytes.end( ) );
+					CONSOLE_Print("[GPROXY] Connection marked as WC3");
+					m_FirstPacket = false;
+			}
+			if( Bytes[0] == 2 )
+			{
+				CONSOLE_Print("[GPROXY] Connection marked as BNFTP");
+				m_FirstPacket = false;
+				m_IsBNFTP = true;
+			}
+	}
+	if (m_IsBNFTP)
+	{
+		m_RemoteSocket->PutBytes( Bytes );
+		return;
+	}
+	 // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
+	while( Bytes.size( ) >= 4 )
+	{
+			// byte 0 is always 255
+            
+			if( Bytes[0] == 255 )
+			{
+					// bytes 2 and 3 contain the length of the packet
 
-        // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
+					uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
 
-        while( Bytes.size( ) >= 4 )
-        {
-                // byte 0 is always 255
-                
-                if( Bytes[0] == 255 )
-                {
-                        // bytes 2 and 3 contain the length of the packet
-
-                        uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
-
-                        if( Length >= 4 )
-                        {
-                                if( Bytes.size( ) >= Length )
-                                {
-                                        BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
-                                        CCommandPacket *pck = new CCommandPacket( 255,Bytes[1], Data);
-                                        ProcessWC3Packet(pck);
-                                        *RecvBuffer = RecvBuffer->substr( Length );
-										Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
-                                }
-                                else
-                                        return;
-                        }
-                        else
-                        {
-                               CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad length)" );
-                                return;
-                        }
-                }
-                else
-                {
-                        CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad header constant)" );
-                        return;
-                }
-         }
+					if( Length >= 4 )
+					{
+							if( Bytes.size( ) >= Length )
+							{
+									BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
+									m_LocalPackets.push( new CCommandPacket( 255,Bytes[1], Data) );
+									*RecvBuffer = RecvBuffer->substr( Length );
+									Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
+							}
+							else
+									return;
+					}
+					else
+					{
+						   CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad length)" );
+							return;
+					}
+			}
+			else
+			{
+					CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad header constant)" );
+					return;
+			}
+	}
 	}
 }
-void CWC3 :: ProcessWC3Packet(CCommandPacket *packet )
+void CWC3 :: ProcessWC3Packets( )
 {
-        bool forward = true;
+	queue<CCommandPacket *> temp;
+	bool forward = true;
+	while (!m_LocalPackets.empty( ) )
+	{
+		forward = true;
+		CCommandPacket *packet = m_LocalPackets.front( );
+		m_LocalPackets.pop( );
         switch (packet->GetID( ))
         {
              case SID_CHATCOMMAND : Handle_SID_CHATCOMMAND(packet->GetData( )); forward = false; break;
         }
         if (forward)
         {
-			m_RemoteSocket->PutBytes(packet->GetData( ));
+			if (m_RemoteSocket->GetConnected( ) )
+			{
+			  m_RemoteSocket->PutBytes(packet->GetData( ));
+			}
+			else
+			{
+				temp.push( packet );
+			}
         }
+	}
+	m_LocalPackets = temp;
 }
-void CWC3 :: ExtractBNETPackets( string *RecvBuffer )
+void CWC3 :: ExtractBNETPackets( )
 {
+	string *RecvBuffer = m_RemoteSocket->GetBytes( );
 	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
-    // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
 
+	if (m_IsBNFTP)
+	{
+		m_LocalSocket->PutBytes( Bytes );
+		return;
+	}
+    // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
     while( Bytes.size( ) >= 4 )
     {
             // byte 0 is always 255
@@ -1875,9 +1867,8 @@ void CWC3 :: ExtractBNETPackets( string *RecvBuffer )
                             if( Bytes.size( ) >= Length )
                             {
                                 BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
-                                CCommandPacket *pck = new CCommandPacket( 255,Bytes[1], Data);
-                                ProcessBNETPacket(pck);
-                              //  *RecvBuffer = RecvBuffer->substr( Length );
+                                m_RemotePackets.push( new CCommandPacket( 255,Bytes[1], Data) );
+                                *RecvBuffer = RecvBuffer->substr( Length );
 							    Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
                             }
                             else
@@ -1897,9 +1888,14 @@ void CWC3 :: ExtractBNETPackets( string *RecvBuffer )
     }
 }
 
-void CWC3 :: ProcessBNETPacket(CCommandPacket *packet )
+void CWC3 :: ProcessBNETPackets( )
 {
-        bool forward = true;
+    bool forward = true;
+	while ( !m_RemotePackets.empty( ) )
+	{
+		forward = true;
+		CCommandPacket *packet = m_RemotePackets.front( );
+		m_RemotePackets.pop( );
         switch (packet->GetID( ))
         {
            case SID_GETADVLISTEX : Handle_SID_GETADVLISTEX(packet->GetData( )); forward = false; break;
@@ -1909,6 +1905,8 @@ void CWC3 :: ProcessBNETPacket(CCommandPacket *packet )
         {
            m_LocalSocket->PutBytes(packet->GetData( ));
         }
+		
+	}
 }
 void CWC3 :: SendLocalChat( string message )
 {

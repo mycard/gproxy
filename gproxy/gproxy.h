@@ -123,7 +123,6 @@ public:
 	string m_JoinedName;
 	string m_HostName;
 	CTCPServer *m_WC3Server;
-	CWC3 *m_WC3;
 	string m_GIndicator;
 	vector<CWC3 *> m_Connections;
 
@@ -263,17 +262,19 @@ private:
 
 	CTCPSocket *m_LocalSocket;
 	CTCPClient *m_RemoteSocket;
-	bool m_IsWC3;
+	bool m_IsBNFTP;
 	string m_GIndicator;
 	bool m_FirstPacket;
 	vector<CIncomingGameHost *> m_Games;
-	queue<string *> m_TempBuffer;
+	queue<CCommandPacket *> m_LocalPackets;
+	queue<CCommandPacket *> m_RemotePackets;
 
-	void ExtractWC3Packets( string *RecvBuffer );
-	void ProcessWC3Packet(CCommandPacket *packet );
+	
+	void ExtractWC3Packets();
+	void ProcessWC3Packets();
 
-	void ExtractBNETPackets( string *RecvBuffer );
-	void ProcessBNETPacket(CCommandPacket *packet );
+	void ExtractBNETPackets();
+	void ProcessBNETPackets();
 	
 	bool AssignLength( BYTEARRAY &content );
 	bool ValidateLength( BYTEARRAY &content );
