@@ -1179,10 +1179,7 @@ bool CGPG ::Update( void *fd, void *send_fd )
 	if( m_LocalSocket->HasError( ) || !m_LocalSocket->GetConnected( ) )
 	{
 		CONSOLE_Print( "[GPROXY] local player disconnected" );
-
-		delete m_LocalSocket;
-		m_LocalSocket = NULL;
-
+	
 		// ensure a leavegame message was sent, otherwise the server may wait for our reconnection which will never happen
 		// if one hasn't been sent it's because Warcraft III exited abnormally
 
@@ -1199,11 +1196,7 @@ bool CGPG ::Update( void *fd, void *send_fd )
 			m_RemoteSocket->PutBytes( LeaveGame );
 			m_RemoteSocket->DoSend( (fd_set *)send_fd );
 		}
-
-		m_RemoteSocket->Reset( );
-		m_RemoteSocket->SetNoDelay( true );
-		m_RemoteServerIP.clear( );
-		m_RemoteServerPort = 0;
+		return true;
 	}
 	else
 	{
@@ -1251,13 +1244,7 @@ bool CGPG ::Update( void *fd, void *send_fd )
 				else
 				{
 					m_LocalSocket->Disconnect( );
-					delete m_LocalSocket;
-					m_LocalSocket = NULL;
-					m_RemoteSocket->Reset( );
-					m_RemoteSocket->SetNoDelay( true );
-					m_RemoteServerIP.clear( );
-					m_RemoteServerPort = 0;
-					return false;
+					return true;
 				}
 			}
 
@@ -1283,13 +1270,7 @@ bool CGPG ::Update( void *fd, void *send_fd )
 				else
 				{
 					m_LocalSocket->Disconnect( );
-					delete m_LocalSocket;
-					m_LocalSocket = NULL;
-					m_RemoteSocket->Reset( );
-					m_RemoteSocket->SetNoDelay( true );
-					m_RemoteServerIP.clear( );
-					m_RemoteServerPort = 0;
-					return false;
+					return true;
 				}
 			}
 
@@ -1385,13 +1366,7 @@ bool CGPG ::Update( void *fd, void *send_fd )
 					else
 					{
 						m_LocalSocket->Disconnect( );
-						delete m_LocalSocket;
-						m_LocalSocket = NULL;
-						m_RemoteSocket->Reset( );
-						m_RemoteSocket->SetNoDelay( true );
-						m_RemoteServerIP.clear( );
-						m_RemoteServerPort = 0;
-						return false;
+						return true;
 					}
 				}
 			}
