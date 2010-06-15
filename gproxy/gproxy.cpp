@@ -316,10 +316,14 @@ CGProxy :: CGProxy( string nServer, uint16_t nPort )
 	m_Exiting = false;
 	m_Server = nServer;
 	m_Port = nPort;
-
+	m_W3CC = NULL;
+	m_GPGC = NULL;
+	m_GameServer = new CTCPServer ( );
+	m_GameServer->Listen( string( ), m_Port );
 	m_WC3Server = new CTCPServer( );
 	m_WC3Server->Listen( string( ), 6112 );
 	CONSOLE_Print("[GPROXY] Listening for warcraft 3 connections on port 6112");
+	CONSOLE_Print("[GPROXY] Listening for game connections on port " + UTIL_ToString( m_Port ) );
 	CONSOLE_Print( "[GPROXY] GProxy++ Version " + m_Version );
 	
 }
@@ -327,10 +331,11 @@ CGProxy :: CGProxy( string nServer, uint16_t nPort )
 CGProxy :: ~CGProxy( )
 {
 	delete m_WC3Server;
+	delete m_GameServer;
+	delete m_W3CC;
+	delete m_GPGC;
 
-	for( vector<CWC3 *> ::iterator i = m_WC3Connections.begin( ); i != m_WC3Connections.end( ); i++ )
-		delete *i;
-	for( vector<CGPG *> ::iterator i = m_GameConnections.begin( ); i != m_GameConnections.end( ); i++)
+	for( vector<CPotentialSocket *>::iterator i = m_Potentials.begin( ) ; i!= m_Potentials.end( ); i++ )
 		delete *i;
 }
 
@@ -351,19 +356,31 @@ bool CGProxy :: Update( long usecBlock )
 	m_WC3Server->SetFD( &fd, &send_fd, &nfds );
 	NumFDs++;
 
-	// 2. the wc3 connections
-	for(vector<CWC3 * > ::iterator i = m_WC3Connections.begin( ); i != m_WC3Connections.end( ); i++)
-	{	
-		NumFDs += (*i)->SetFD(&fd,&send_fd,&nfds);
-	}
-
-	// 3. the gproxy games
+	// 2. the game server
 	
-	for(vector<CGPG *> ::iterator i = m_GameConnections.begin( ); i != m_GameConnections.end( ); i++ )
+	m_GameServer->SetFD( &fd ,&send_fd, &nfds );
+	NumFDs++;
+
+	// 3. the W3CC
+
+	if ( m_W3CC )
 	{
-		NumFDs += (*i)->SetFD( &fd, &send_fd, &nfds );
+		NumFDs += m_W3CC->SetFD( &fd , &send_fd , &nfds );
 	}
 
+	// 4. the GPGC
+
+	if ( m_GPGC )
+	{
+		NumFDs += m_GPGC->SetFD( &fd, &send_fd, &nfds );
+	}
+
+	// 5. the potential sockets
+
+	for(vector<CPotentialSocket *>::iterator i = m_Potentials.begin( ) ; i!=m_Potentials.end( );i++ )
+	{
+		NumFDs += (*i)->SetFD( &fd, &send_fd , &nfds );
+	}
 
 
 
@@ -387,41 +404,66 @@ bool CGProxy :: Update( long usecBlock )
 		MILLISLEEP( 50 );
 
 	// accept warcraft 3 connections
-	CTCPSocket *CNewSocket = m_WC3Server->Accept( &fd );
-	if (CNewSocket)
+	CTCPSocket *NewSocket = m_WC3Server->Accept( &fd );
+	/*if (CNewSocket)
 	{
-		m_WC3Connections.push_back( new CWC3( CNewSocket, m_Server ,6112,m_GIndicator,m_Port +(uint16_t)m_WC3Connections.size( )+ 1));
+		m_WC3Connections.push_back( new CW3CC( CNewSocket, m_Server ,6112,m_GIndicator,m_Port +(uint16_t)m_WC3Connections.size( )+ 1));
+	}*/
+	if ( NewSocket )
+	{
+		m_Potentials.push_back( new CPotentialSocket( this, NewSocket, m_Server, 6112 ) );
+		CONSOLE_Print("[WC3Server : " + NewSocket->GetIPString( ) +" ] new connection request accepted");
 	}
-	
-	// update the warcraft 3 connections
 
-	for( vector<CWC3 *> ::iterator i = m_WC3Connections.begin( ) ; i != m_WC3Connections.end( ); )
+	NewSocket = m_GameServer->Accept( &fd );
+	if ( NewSocket )
 	{
-		if ((*i)->Update( &fd, &send_fd ) )
+		if ( m_W3CC )
 		{
-			delete *i;
-			i = m_WC3Connections.erase( i );
-			CONSOLE_Print("[GPROXY] Deleting connection");
+			if ( m_GPGC )
+			{
+				// connection already exists
+				delete NewSocket;
+			}
+			else
+			{
+				m_GPGC = new CGPG( NewSocket,m_W3CC->GetGames( ) );
+			}
 		}
 		else
 		{
-			i++;
+			CONSOLE_Print("[GAMESERVER] Game connection discared because there is no active W3CC" );
+			delete NewSocket;
 		}
 	}
 
-	// update the gproxy games
-
-	for( vector<CGPG *> ::iterator i = m_GameConnections.begin( ); i != m_GameConnections.end( ); )
+	if ( m_W3CC )
 	{
-		if ((*i)->Update( &fd, &send_fd ) )
+		if ( m_W3CC->Update( &fd, &send_fd ) )
+		{
+			delete m_W3CC;
+			m_W3CC = NULL;
+		}
+	}
+
+	if ( m_GPGC )
+	{
+		if ( m_GPGC->Update( &fd , &send_fd ) )
+		{
+			delete m_GPGC;
+			m_GPGC = NULL;
+		}
+	}
+
+	for ( vector<CPotentialSocket *> ::iterator i = m_Potentials.begin( ) ; i != m_Potentials.end( ); )
+	{
+		if ( (*i)->Update( &fd , &send_fd ) )
 		{
 			delete *i;
-			i = m_GameConnections.erase( i );
+			i = m_Potentials.erase( i) ;
 		}
 		else
-		{
 			i++;
-		}
 	}
 
 	return m_Exiting;
@@ -489,7 +531,6 @@ CIncomingGameHost :: CIncomingGameHost( uint16_t nGameType, uint16_t nParameter,
 
 CIncomingGameHost :: ~CIncomingGameHost( )
 {
-
 }
 
 BYTEARRAY CIncomingGameHost :: GetData(string indicator,uint16_t port )
@@ -556,104 +597,227 @@ string CIncomingGameHost :: GetIPString( )
 ////  WC3    ////
 /////////////////
 
-CWC3 :: CWC3( CTCPSocket *socket, string hostname,uint16_t port,string indicator,uint16_t gameport)
+/// cproxy
+
+CProxy :: CProxy ( CTCPSocket * socket, string hostname, uint16_t port ,bool connect,string ConsoleSender )
 {
 	m_LocalSocket = socket;
-	m_LocalSocket->SetNoDelay( true );
-	m_RemoteSocket = new CTCPClient( );
-	m_RemoteSocket->SetNoDelay( true );
-	m_GameServer = new CTCPServer( );
-	m_GameServer->Listen( string( ), gameport );
-	CONSOLE_Print("[GPROXY] Listening for connections on port " + UTIL_ToString( gameport ));
-	m_RemoteSocket->Connect( string( ) , hostname, port );
-	CONSOLE_Print("[GPROXY] Initiating the two way connection" );
-	m_GamePort = gameport;
-	m_GIndicator = indicator;
-	m_FirstPacket = true;
-	m_IsBNFTP = false;
+	m_RemoteHost = hostname;
+	m_Exiting = false;
+	m_RemotePort = port;
+	m_ConsoleSender = ConsoleSender;
+	if( connect )
+	{
+		m_RemoteSocket = new CTCPClient( );
+		m_RemoteSocket->SetNoDelay( true );
+		m_RemoteSocket->Connect( string ( ), hostname,port );
+		CONSOLE_Print("["+m_ConsoleSender+"] remote connection started for " + hostname );
+	}
+	else
+		m_RemoteSocket = NULL;
 }
-CWC3 ::~CWC3( )
-{ 
-	delete m_LocalSocket;
-	delete m_RemoteSocket;
-	delete m_GameServer;
+CProxy :: CProxy( CTCPSocket * Local,CTCPClient *Remote )
+{
+	m_LocalSocket = Local;
+	m_RemoteSocket = Remote;
+	m_Exiting = false;
 }
-unsigned int CWC3 :: SetFD(void *fd, void *send_fd, int *nfds) 
+CProxy :: ~CProxy()
+{
+	if ( m_Dispose )
+	{
+		delete m_LocalSocket;
+		delete m_RemoteSocket;
+	}
+}
+unsigned int CProxy::SetFD(void *fd, void *send_fd, int *nfds)
 {
 	unsigned int NumFDs = 0;
 	if ( !m_LocalSocket->HasError( ) && m_LocalSocket->GetConnected( ) )
 	{
-		m_LocalSocket->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
+		m_LocalSocket->SetFD( (fd_set * ) fd, ( fd_set * ) send_fd , nfds );
 		NumFDs++;
 	}
-    if ( !m_RemoteSocket->HasError( ) && m_RemoteSocket->GetConnected( ) )
+	if( m_RemoteSocket )
 	{
-		m_RemoteSocket->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
-		NumFDs++;
+		if ( !m_RemoteSocket->HasError( )  && m_RemoteSocket->GetConnected( ) )
+		{
+			m_RemoteSocket->SetFD( ( fd_set * ) fd, ( fd_set * ) send_fd , nfds );
+			NumFDs++;
+		}
 	}
-	m_GameServer->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
-	NumFDs++;
 	return NumFDs;
 }
-
-bool CWC3 :: Update(void *fd, void *send_fd) 
+bool CProxy ::Update(void *fd, void *send_fd)
 {
-	CTCPSocket *NewSocket = m_GameServer->Accept( (fd_set *)fd );
-	if ( NewSocket )
-	{
-		gGProxy->m_GameConnections.push_back( new CGPG( NewSocket, m_Games ) );
-	}
-	// local socket
 	if ( m_LocalSocket->HasError( ) )
 	{
-		CONSOLE_Print("[GPROXY] Local socket disconnected due to socket error");
+		CONSOLE_Print( "[" + m_ConsoleSender + "] local socket disconnected due to socket error ");
+		m_Exiting = true;
 		m_RemoteSocket->Disconnect( );
-		return true;
 	}
-	else if( !m_LocalSocket->GetConnected( ) )
+	else if ( !m_LocalSocket->GetConnected( ) )
 	{
-		CONSOLE_Print("[GPROXY] Local socket disconnected" );
-		m_RemoteSocket->Disconnect( );
-		return true;
+		CONSOLE_Print( "[" + m_ConsoleSender + "] local socket disconnected");
+		m_Exiting = true;
+		m_RemoteSocket->Disconnect( );	
+	}
+	else if ( m_LocalSocket->GetConnected( ) )
+	{
+		m_LocalSocket->DoRecv( (fd_set * )fd );
+		OnLocalDataArrival( );
+	    m_LocalSocket->DoSend( (fd_set * ) send_fd );
+	}
+
+	if ( m_RemoteSocket )
+	{	
+		if ( m_RemoteSocket->HasError( ) )
+		{
+			CONSOLE_Print( "[" + m_ConsoleSender + "] remote socket disconnected due to socket error ");
+			m_Exiting = true;
+			m_LocalSocket->Disconnect( );
+		}
+		else if ( !m_RemoteSocket->GetConnected( ) && !m_RemoteSocket->GetConnecting( ) )
+		{
+			CONSOLE_Print( "[" + m_ConsoleSender + "] remote socket disconnected ");
+			m_Exiting = true;
+			m_LocalSocket->Disconnect( );
+		}
+		else if ( m_RemoteSocket->GetConnecting( ))
+		{
+			if ( m_RemoteSocket->CheckConnect( ) )
+			{
+				CONSOLE_Print("[" +m_ConsoleSender +"] remote socket connected with [" + m_RemoteSocket->GetIPString( ) +"]");
+				OnRemoteConnect( );
+			}
+		}
+		if ( m_RemoteSocket->GetConnected( ) )
+		{
+			m_RemoteSocket->DoRecv( (fd_set *) fd );
+			OnRemoteDataArrival(  );
+			
+			m_RemoteSocket->DoSend( (fd_set * ) send_fd );
+		}
+	}
+	return m_Exiting;
+}
+void CProxy :: OnLocalDataArrival()
+{
+	string *RecvBuffer = m_LocalSocket->GetBytes( );
+	BYTEARRAY data = UTIL_CreateByteArray( (unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ));
+	if ( !m_RemoteSocket->GetConnected( ) )
+	{
+		m_PacketBuffer.push( data );
+		m_LocalSocket->ClearRecvBuffer( );
 	}
 	else
 	{
-		m_LocalSocket->DoRecv( (fd_set *)fd );
-		ExtractWC3Packets( );
-		ProcessWC3Packets( );
-	}
+		m_RemoteSocket->PutBytes( data );
+		m_LocalSocket->ClearRecvBuffer( );
 
-	// remote socket
+	}
+}
+void CProxy :: OnRemoteDataArrival( )
+{
+	string *RecvBuffer = m_RemoteSocket->GetBytes( );
+	m_LocalSocket->PutBytes( *RecvBuffer );
+	m_RemoteSocket->ClearRecvBuffer( );
+}
+void CProxy :: OnRemoteConnect( )
+{
+	while ( !m_PacketBuffer.empty( ) )
+	{
+		m_RemoteSocket->PutBytes( m_PacketBuffer.front( ) );
+		m_PacketBuffer.pop( );
+	}
+}
 
-	if ( m_RemoteSocket->HasError( ) )
+
+/// potential socket
+CPotentialSocket::CPotentialSocket(CGProxy *gproxy, CTCPSocket *socket, string hostname, uint16_t port): CProxy(socket,hostname,port,false,"PotentialSocket")
+{
+	m_GProxy = gproxy;
+}
+CPotentialSocket::~CPotentialSocket( )
+{
+}
+void CPotentialSocket ::OnLocalDataArrival( )
+{
+	string *RecvBuffer = m_LocalSocket->GetBytes( );
+	BYTEARRAY data = UTIL_CreateByteArray((unsigned char *)RecvBuffer->c_str( ),RecvBuffer->size( ) );
+	if ( data.size( ) > 0 )
 	{
-		CONSOLE_Print("[GPROXY] Remote socket disconnected due to socket error" );
-		m_LocalSocket->Disconnect( );
-		return true;
-	}
-	else if (!m_RemoteSocket->GetConnected( ) && !m_RemoteSocket->GetConnecting( ) )
-	{
-		CONSOLE_Print("[GPROXY] Remote socket disconnected" );
-	}
-	else if (m_RemoteSocket->GetConnecting( ) )
-	{
-		if (m_RemoteSocket->CheckConnect( ))
+		if ( data[0] == 1)
 		{
-			CONSOLE_Print("[GPROXY] Remote socket connected with ["+ m_RemoteSocket->GetIPString( ) +"]");
+			// wc3 connection
+			m_ConsoleSender = "W3CC";
+			Print("connection marked as Warcraft III Client Connection ( W3CC )");
+			m_RemoteSocket = new CTCPClient( );
+			m_RemoteSocket->SetNoDelay(true);
+			m_RemoteSocket->Connect( string( ) ,m_RemoteHost,6112 );
+			m_PacketBuffer.push( data );
+			m_LocalSocket->ClearRecvBuffer( );
+			m_GProxy->m_W3CC =  new CW3CC( m_LocalSocket,m_RemoteSocket,m_RemoteHost,m_GProxy, m_PacketBuffer );
+			m_Exiting = true;
+			m_Dispose = false;
+		}
+		else if ( data[0] == 2 )
+		{
+			if ( !m_RemoteSocket )
+			{
+				m_ConsoleSender = "BNFTP";
+				Print("connection marked as Battle.Net's FTP ( BNFTP )");
+				m_RemoteSocket->Connect( string( ), m_RemoteHost,6112);
+				m_PacketBuffer.push( data );
+				m_LocalSocket->ClearRecvBuffer( );
+			}
+			else
+				m_RemoteSocket->PutBytes( data );
+			    m_LocalSocket->ClearRecvBuffer( );
+		}
+		else if ( data[0] == 247 )
+		{
+			if ( !m_RemoteSocket )
+			{
+				string GameName = m_GProxy->m_GPGC->GetGameName( );
+				vector<CIncomingGameHost *> Games = m_GProxy->m_W3CC->GetGames( );
+				for ( vector<CIncomingGameHost *>::iterator i = Games.begin( ); i != Games.end( );i++ )
+				{
+					if ( (*i)->GetGameName( ) == GameName )
+					{
+
+						m_RemoteSocket = new CTCPClient( );
+						m_RemoteSocket->SetNoDelay(true);
+						m_RemoteSocket->Connect( string( ) ,(*i)->GetIPString( ),6112 );
+						m_ConsoleSender = "GCA";
+						Print("connection marked as Game Client Accounce ( GCA )");
+						m_PacketBuffer.push(data);
+						m_LocalSocket->ClearRecvBuffer( );
+					}
+				}
+			}
+			else
+			{
+				m_RemoteSocket->PutBytes(data);
+				m_LocalSocket->ClearRecvBuffer( );
+			}
 		}
 	}
-	if ( m_RemoteSocket->GetConnected( ) )
-	{
-		m_RemoteSocket->DoRecv( (fd_set *)fd);
-		ExtractBNETPackets( );
-		ProcessBNETPackets( );
-	}
-
-	m_RemoteSocket->DoSend( (fd_set *) send_fd );
-	m_LocalSocket->DoSend( (fd_set * ) send_fd );
-	return false;
 }
-void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
+CW3CC :: CW3CC(CTCPSocket *socket,CTCPClient *remote,string Server,CGProxy *gproxy,queue<BYTEARRAY > packetbuffer ) : CProxy( socket,remote)
+{
+	m_GProxy = gproxy;
+	m_PacketBuffer = packetbuffer;
+	m_Server = Server;
+	m_GIndicator = m_GProxy->m_GIndicator;
+	m_ConsoleSender = "W3CC";
+	m_Dispose = true;
+}
+CW3CC ::~CW3CC( )
+{ 
+}
+
+void CW3CC :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
 {
 	// DEBUG_Print( "RECEIVED SID_GETADVLISTEX" );
 	// DEBUG_Print( data );
@@ -780,12 +944,12 @@ void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
 	UTIL_AppendByteArray(packet,(uint32_t)m_Games.size( ),false);
 	for( vector<CIncomingGameHost *> :: iterator i = m_Games.begin( ); i != m_Games.end( ); i++ )
 	{
-		UTIL_AppendByteArray(packet,(*i)->GetData(m_GIndicator,m_GamePort ));
+		UTIL_AppendByteArray(packet,(*i)->GetData(m_GIndicator,m_GProxy->m_Port ));
 	}
 	AssignLength(packet);
 	m_LocalSocket->PutBytes(packet);
 }
-void CWC3 :: Handle_SID_CHATEVENT(BYTEARRAY data)
+void CW3CC :: Handle_SID_CHATEVENT(BYTEARRAY data)
 {
 	// DEBUG_Print( "RECEIVED SID_CHATEVENT" );
 	// DEBUG_Print( data );
@@ -809,16 +973,17 @@ void CWC3 :: Handle_SID_CHATEVENT(BYTEARRAY data)
 		string Message = string(message.begin( ),message.end( ));
 		switch (UTIL_ByteArrayToUInt32(EventID,false))
 		{
-		case EID_TALK: CONSOLE_Print("[LOCAL] user ["+User+"] said "+ Message); break;
-		case EID_WHISPER: CONSOLE_Print("[WHISPER] user ["+User+"] whispered "+ Message); break;
-		case EID_EMOTE:  CONSOLE_Print("[EMOTE] user ["+User+"] said "+ Message); break;
+		case EID_TALK: CONSOLE_Print("[LOCAL] ["+User+"] "+ Message); break;
+		case EID_WHISPER: CONSOLE_Print("[WHISPER] ["+User+"] "+ Message); break;
+		case EID_EMOTE:  CONSOLE_Print("[EMOTE] ["+User+"] "+ Message); break;
 		case EID_CHANNEL: CONSOLE_Print("[BNET] joined channel ["+Message+"]"); break;
 		case EID_INFO : CONSOLE_Print("[INFO] "+Message); break;
 		case EID_ERROR: CONSOLE_Print("[ERROR] " +Message); break;
+		case EID_WHISPERSENT: CONSOLE_Print("[WHISPERED] ["+ User +"] " + Message); break;
 		}
 	}
 }
-void CWC3 :: Handle_SID_CHATCOMMAND(BYTEARRAY data)
+void CW3CC :: Handle_SID_CHATCOMMAND(BYTEARRAY data)
 {
 	if (ValidateLength(data))
 	{
@@ -830,7 +995,46 @@ void CWC3 :: Handle_SID_CHATCOMMAND(BYTEARRAY data)
 		}
 	}
 }
-bool CWC3 :: ProcessCommand(string Message)
+void CW3CC :: Handle_SID_NOTIFYJOIN( BYTEARRAY data )
+{/*
+	(DWORD) Product ID *
+	(DWORD) Product version
+	(STRING) Game Name
+	(STRING) Game Password*/
+
+	BYTEARRAY ProductID = BYTEARRAY( data.begin( ) + 4 , data.begin( ) + 8 );
+	BYTEARRAY ProductVersion = BYTEARRAY( data.begin( ) + 8,data.begin( ) + 12 );
+	BYTEARRAY GameName = UTIL_ExtractCString( data, 12 );
+	string Gamename = string(GameName.begin( ), GameName.end( ) );
+	
+	if ( Gamename.size( ) >= m_GIndicator.size( ) && Gamename.substr( 0,m_GIndicator.size( )) == m_GIndicator  )
+	{
+		Gamename = Gamename.substr( m_GIndicator.size( ) );
+		for(vector<CIncomingGameHost *>::iterator i = m_Games.begin( ) ; i != m_Games.end( ) ; i++ )
+		{
+			if ( (*i)->GetGameName( ).size( ) > Gamename.size( ) && (*i)->GetGameName( ).substr(0,Gamename.size( )) == Gamename )
+			{
+				Gamename = (*i)->GetGameName( );
+				CONSOLE_Print("[GPROXY] Sending notification for game [" +Gamename +"]");
+				break;
+			}
+		}
+	}
+	//construct the packet;
+	BYTEARRAY packet;
+	packet.push_back(255);
+	packet.push_back(SID_NOTIFYJOIN);
+	packet.push_back(0);
+	packet.push_back(0);
+	UTIL_AppendByteArray( packet, ProductID );
+	UTIL_AppendByteArray( packet, ProductVersion );
+	UTIL_AppendByteArrayFast( packet, Gamename );
+	packet.push_back(0);
+	AssignLength(packet);
+	m_RemoteSocket->PutBytes(packet);
+
+}
+bool CW3CC :: ProcessCommand(string Message)
 {
 	string Command;
 	string Payload;
@@ -867,44 +1071,16 @@ bool CWC3 :: ProcessCommand(string Message)
 
 
 
-void CWC3 :: ExtractWC3Packets( )
+void CW3CC :: ExtractWC3Packets( )
 {
 	string *RecvBuffer = m_LocalSocket->GetBytes( );
-	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
-	if ( m_FirstPacket )
-	{
-		if( Bytes.size( ) >= 1)
-		{
-			if( Bytes[0] == 1 )
-			{
-					BYTEARRAY packet;
-					packet.push_back(1);
-					m_RemoteSocket->PutBytes(packet);
-					*RecvBuffer = RecvBuffer->substr( 1 );
-					Bytes = BYTEARRAY( Bytes.begin( ) + 1, Bytes.end( ) );
-					CONSOLE_Print("[GPROXY] Connection marked as WC3");
-					m_FirstPacket = false;
-			}
-			if( Bytes[0] == 2 )
-			{
-				CONSOLE_Print("[GPROXY] Connection marked as BNFTP");
-				m_FirstPacket = false;
-				m_IsBNFTP = true;
-			}
-		}
-	}
-	if (m_IsBNFTP)
-	{
-		m_RemoteSocket->PutBytes( Bytes );
-		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
-		return;
-	}
-	 // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
+	BYTEARRAY Bytes = UTIL_CreateByteArray((unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ) );
+	// a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
 	while( Bytes.size( ) >= 4 )
 	{
 			// byte 0 is always 255
             
-			if( Bytes[0] == 255 )
+			if( Bytes[0] == 255)
 			{
 					// bytes 2 and 3 contain the length of the packet
 
@@ -924,18 +1100,18 @@ void CWC3 :: ExtractWC3Packets( )
 					}
 					else
 					{
-						   CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad length)" );
+						   Print("received invalid packet from wc3 (bad length)" );
 							return;
 					}
 			}
 			else
 			{
-					CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad header constant)" );
+					Print("received invalid packet from wc3 (bad header constant)" );
 					return;
 			}
 	}
 }
-void CWC3 :: ProcessWC3Packets( )
+void CW3CC :: ProcessWC3Packets( )
 {
 	queue<CCommandPacket *> temp;
 	bool forward = true;
@@ -947,6 +1123,7 @@ void CWC3 :: ProcessWC3Packets( )
         switch (packet->GetID( ))
         {
              case SID_CHATCOMMAND : Handle_SID_CHATCOMMAND(packet->GetData( )); forward = false; break;
+			 case SID_NOTIFYJOIN : Handle_SID_NOTIFYJOIN(packet->GetData( ) ); forward = false; break;
         }
         if (forward)
         {
@@ -962,17 +1139,10 @@ void CWC3 :: ProcessWC3Packets( )
 	}
 	m_LocalPackets = temp;
 }
-void CWC3 :: ExtractBNETPackets( )
+void CW3CC :: ExtractBNETPackets( )
 {
 	string *RecvBuffer = m_RemoteSocket->GetBytes( );
-	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
-
-	if (m_IsBNFTP)
-	{
-		m_LocalSocket->PutBytes( Bytes );
-		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
-		return;
-	}
+	BYTEARRAY Bytes = UTIL_CreateByteArray((unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ) );
     // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
     while( Bytes.size( ) >= 4 )
     {
@@ -990,7 +1160,7 @@ void CWC3 :: ExtractBNETPackets( )
                             {
                                 BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
                                 m_RemotePackets.push( new CCommandPacket( 255,Bytes[1], Data) );
-                                *RecvBuffer = RecvBuffer->substr( Length );
+								*RecvBuffer = RecvBuffer->substr( Length );
 							    Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
                             }
                             else
@@ -998,19 +1168,19 @@ void CWC3 :: ExtractBNETPackets( )
                     }
                     else
                     {
-                            CONSOLE_Print( "[GPROXY] received invalid packet from bnet (bad length)" );
+                            Print("received invalid packet from bnet (bad length)" );
                             return;
                     }
             }
             else
             {
-                    CONSOLE_Print( "[GPROXY] received invalid packet from bnet (bad header constant)" );
+                   Print("received invalid packet from bnet (bad header constant)" );
                     return;
             }
     }
 }
 
-void CWC3 :: ProcessBNETPackets( )
+void CW3CC :: ProcessBNETPackets( )
 {
     bool forward = true;
 	while ( !m_RemotePackets.empty( ) )
@@ -1030,7 +1200,7 @@ void CWC3 :: ProcessBNETPackets( )
 		
 	}
 }
-void CWC3 :: SendLocalChat( string message )
+void CW3CC :: SendLocalChat( string message )
 {
     // send the message from user gproxy as a whisper using the sid_chatevent packet;
     string user = "GProxy"; // you can change that to whatever you want
@@ -1051,7 +1221,7 @@ void CWC3 :: SendLocalChat( string message )
     m_LocalSocket->PutBytes(packet);
 }
 
-void CWC3 :: SendChatCommand( string message )
+void CW3CC :: SendChatCommand( string message )
 {
     BYTEARRAY packet;
     packet.push_back(255);
@@ -1062,7 +1232,7 @@ void CWC3 :: SendChatCommand( string message )
     AssignLength(packet);
     m_RemoteSocket->PutBytes(packet);
 }
-bool CWC3 :: AssignLength( BYTEARRAY &content )
+bool CW3CC :: AssignLength( BYTEARRAY &content )
 {
 	// insert the actual length of the content array into bytes 3 and 4 (indices 2 and 3)
 
@@ -1079,7 +1249,7 @@ bool CWC3 :: AssignLength( BYTEARRAY &content )
 	return false;
 }
 
-bool CWC3 :: ValidateLength( BYTEARRAY &content )
+bool CW3CC :: ValidateLength( BYTEARRAY &content )
 {
 	// verify that bytes 3 and 4 (indices 2 and 3) of the content array describe the length
 
@@ -1933,6 +2103,9 @@ void CGPG :: SendEmptyAction( )
 		m_LocalSocket->PutBytes( StartLag );
 	}
 }
+
+
+
 
 
 
