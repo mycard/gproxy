@@ -25,8 +25,6 @@
 #include "commandpacket.h"
 #include "gameprotocol.h"
 #include "gpsprotocol.h"
-#include "ui/ui.h"
-#include "ui/forward.h"
 
 #include <signal.h>
 #include <stdlib.h>
