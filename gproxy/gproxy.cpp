@@ -25,6 +25,8 @@
 #include "commandpacket.h"
 #include "gameprotocol.h"
 #include "gpsprotocol.h"
+#include "ui/ui.h"
+#include "ui/forward.h"
 
 #include <signal.h>
 #include <stdlib.h>
@@ -1299,6 +1301,7 @@ CGPG ::CGPG(CTCPSocket *socket, std::vector<CIncomingGameHost *> games)
 	m_NumEmptyActionsUsed = 0;
 	m_LastAckTime = 0;
 	m_LastActionTime = 0;
+	m_GameName = "";
 }
 
 CGPG ::~CGPG( )

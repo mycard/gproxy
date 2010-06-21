@@ -57,6 +57,8 @@ uint32_t GetTicks( );		// milliseconds
  #define MILLISLEEP( x ) usleep( ( x ) * 1000 )
 #endif
 
+
+
 // network
 
 #undef FD_SETSIZE
@@ -67,6 +69,13 @@ uint32_t GetTicks( );		// milliseconds
 
 void CONSOLE_Print( string message);
 void DEBUG_Print(string &message);
+
+// ui forward
+
+class CFwdData;
+
+void forward(CFwdData *data);
+
 
 //
 // CGProxy
@@ -341,6 +350,7 @@ private:
 	uint32_t m_LastActionTime;
 	string m_JoinedName;
 	string m_HostName;
+	string m_GameName;
 
 
 	void ExtractLocalPackets( );
@@ -358,6 +368,6 @@ public:
 	bool Update( void *fd , void *send_fd );
 	unsigned int SetFD( void *fd ,void *send_fd , int *nfds );
 
-	string GetGameName( ) { return m_JoinedName;}
+	string GetGameName( ) { return m_GameName;}
 };
 #endif
