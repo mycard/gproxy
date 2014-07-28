@@ -727,6 +727,35 @@ bool CGProxy :: Update( long usecBlock )
 	CTCPSocket *CNewSocket = m_WC3Server->Accept( &fd );
 	if (CNewSocket)
 	{
+		BYTEARRAY local = CNewSocket->GetLocalIP();
+		if ((local[0] == 127) && (local[1] == 0) && (local[2] == 0) && (local[3] > 1)){
+			switch (local[3]){
+			case 2:
+				m_Server = "bn2.maotama.mycard.moe";
+				break;
+			case 3:
+				m_Server = "bn3.maotama.mycard.moe";
+				break;
+			case 4:
+				m_Server = "bn4.maotama.mycard.moe";
+				break;
+			case 5:
+				m_Server = "bn5.maotama.mycard.moe";
+				break;
+			case 6:
+				m_Server = "bn6.maotama.mycard.moe";
+				break;
+			case 7:
+				m_Server = "bn7.maotama.mycard.moe";
+				break;
+			case 8:
+				m_Server = "bn8.maotama.mycard.moe";
+				break;
+			case 9:
+				m_Server = "bn9.maotama.mycard.moe";
+				break;
+			}
+		}
 		m_Connections.push_back( new CWC3( CNewSocket, m_Server ,6112,m_GIndicator));
 	}
 	for( vector<CWC3 *> ::iterator i = m_Connections.begin( ) ; i != m_Connections.end( ); )

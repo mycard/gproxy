@@ -112,6 +112,7 @@ public:
 
 	virtual BYTEARRAY GetPort( );
 	virtual BYTEARRAY GetIP( );
+	virtual BYTEARRAY GetLocalIP( );
 	virtual string GetIPString( );
 	virtual bool HasError( )						{ return m_HasError; }
 	virtual int GetError( )							{ return m_Error; }

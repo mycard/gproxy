@@ -62,6 +62,15 @@ BYTEARRAY CSocket :: GetIP( )
 	return UTIL_CreateByteArray( (uint32_t)m_SIN.sin_addr.s_addr, false );
 }
 
+BYTEARRAY CSocket::GetLocalIP()
+{
+	sockaddr_in name;
+	int namelen = sizeof(name);
+	getsockname(m_Socket, (sockaddr*)&name, &namelen);
+	return UTIL_CreateByteArray((uint32_t)name.sin_addr.S_un.S_addr, false);
+
+}
+
 string CSocket :: GetIPString( )
 {
 	return inet_ntoa( m_SIN.sin_addr );
