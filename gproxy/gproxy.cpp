@@ -1154,13 +1154,13 @@ void CGProxy :: ProcessRemotePackets( )
 
 			// we have to wait until now to send the status message since otherwise the slotinfojoin itself wouldn't have been forwarded
 
-			if( Packet->GetID( ) == CGameProtocol :: W3GS_SLOTINFOJOIN )
+			/*if( Packet->GetID( ) == CGameProtocol :: W3GS_SLOTINFOJOIN )
 			{
 				if( m_GameIsReliable )
 					SendLocalChat( "This is a reliable game. Requesting GProxy++ disconnect protection from server..." );
 				else
 					SendLocalChat( "This is an unreliable game. GProxy++ disconnect protection is disabled." );
-			}
+			}*/
 		}
 		else if( Packet->GetPacketType( ) == GPS_HEADER_CONSTANT )
 		{
@@ -1174,7 +1174,7 @@ void CGProxy :: ProcessRemotePackets( )
 					m_PID = Data[6];
 					m_ReconnectKey = UTIL_ByteArrayToUInt32( Data, false, 7 );
 					m_NumEmptyActions = Data[11];
-					SendLocalChat( "GProxy++ disconnect protection is ready (" + UTIL_ToString( ( m_NumEmptyActions + 1 ) * 60 ) + " second buffer)." );
+					//SendLocalChat( "GProxy++ disconnect protection is ready (" + UTIL_ToString( ( m_NumEmptyActions + 1 ) * 60 ) + " second buffer)." );
 					CONSOLE_Print( "[GPROXY] handshake complete, disconnect protection ready (" + UTIL_ToString( ( m_NumEmptyActions + 1 ) * 60 ) + " second buffer)" );
 				}
 				else if( Packet->GetID( ) == CGPSProtocol :: GPS_RECONNECT && Data.size( ) == 8 )
