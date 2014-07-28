@@ -313,30 +313,74 @@ void DEBUG_Print(string message)
 CGProxy :: CGProxy( string nServer, uint16_t nPort )
 {
 	m_Version = "1.0 Custom build Version 2.0";
+	m_LocalServer = new CTCPServer( );
+	m_LocalSocket = NULL;
+	
+	m_RemoteSocket = new CTCPClient( );
+	m_RemoteSocket->SetNoDelay( true );
+	m_GameProtocol = new CGameProtocol( this );
+	m_GPSProtocol = new CGPSProtocol( );
+	m_TotalPacketsReceivedFromLocal = 0;
+	m_TotalPacketsReceivedFromRemote = 0;
 	m_Exiting = false;
 	m_Server = nServer;
 	m_Port = nPort;
-	m_W3CC = NULL;
-	m_GPGC = NULL;
-	m_GameServer = new CTCPServer ( );
-	m_GameServer->Listen( string( ), m_Port );
+	m_LastConnectionAttemptTime = 0;
+	m_LastRefreshTime = 0;
+	m_RemoteServerPort = 0;
+	m_GameIsReliable = false;
+	m_GameStarted = false;
+	m_LeaveGameSent = false;
+	m_ActionReceived = false;
+	m_Synchronized = true;
+	m_ReconnectPort = 0;
+	m_PID = 255;
+	m_ChatPID = 255;
+	m_ReconnectKey = 0;
+	m_NumEmptyActions = 0;
+	m_NumEmptyActionsUsed = 0;
+	m_LastAckTime = 0;
+	m_LastActionTime = 0;
+	// wc3 gui mod
 	m_WC3Server = new CTCPServer( );
+	m_LocalServer->Listen( string( ), m_Port );
 	m_WC3Server->Listen( string( ), 6112 );
+	CONSOLE_Print("[GPROXY] Listening for gproxy games on port ["+UTIL_ToString(m_Port)+"]");
 	CONSOLE_Print("[GPROXY] Listening for warcraft 3 connections on port 6112");
-	CONSOLE_Print("[GPROXY] Listening for game connections on port " + UTIL_ToString( m_Port ) );
 	CONSOLE_Print( "[GPROXY] GProxy++ Version " + m_Version );
 	
 }
 
 CGProxy :: ~CGProxy( )
 {
-	delete m_WC3Server;
-	delete m_GameServer;
-	delete m_W3CC;
-	delete m_GPGC;
-
-	for( vector<CPotentialSocket *>::iterator i = m_Potentials.begin( ) ; i!= m_Potentials.end( ); i++ )
+	delete m_LocalServer;
+	delete m_LocalSocket;
+	delete m_RemoteSocket;
+	for( vector<CIncomingGameHost *> :: iterator i = m_Games.begin( ); i != m_Games.end( ); i++ )
 		delete *i;
+	for( vector<CWC3 *> ::iterator i = m_Connections.begin( ); i != m_Connections.end( ); i++ )
+		delete *i;
+
+	delete m_GameProtocol;
+	delete m_GPSProtocol;
+
+	while( !m_LocalPackets.empty( ) )
+	{
+		delete m_LocalPackets.front( );
+		m_LocalPackets.pop( );
+	}
+
+	while( !m_RemotePackets.empty( ) )
+	{
+		delete m_RemotePackets.front( );
+		m_RemotePackets.pop( );
+	}
+
+	while( !m_PacketBuffer.empty( ) )
+	{
+		delete m_PacketBuffer.front( );
+		m_PacketBuffer.pop( );
+	}
 }
 
 bool CGProxy :: Update( long usecBlock )
@@ -350,36 +394,37 @@ bool CGProxy :: Update( long usecBlock )
 	fd_set send_fd;
 	FD_ZERO( &fd );
 	FD_ZERO( &send_fd );
+
+	// 2. the local server
+
+	m_LocalServer->SetFD( &fd, &send_fd, &nfds );
+	NumFDs++;
+
+	// 3. the local socket
+
+	if( m_LocalSocket )
+	{
+		m_LocalSocket->SetFD( &fd, &send_fd, &nfds );
+		NumFDs++;
+	}
+
+	// 4. the remote socket
+
+	if( !m_RemoteSocket->HasError( ) && m_RemoteSocket->GetConnected( ) )
+	{
+		m_RemoteSocket->SetFD( &fd, &send_fd, &nfds );
+		NumFDs++;
+	}
 	
-	// 1. the wc3server
+	// 5. the wc3server
 
 	m_WC3Server->SetFD( &fd, &send_fd, &nfds );
 	NumFDs++;
 
-	// 2. the game server
-	
-	m_GameServer->SetFD( &fd ,&send_fd, &nfds );
-	NumFDs++;
-
-	// 3. the W3CC
-
-	if ( m_W3CC )
-	{
-		NumFDs += m_W3CC->SetFD( &fd , &send_fd , &nfds );
-	}
-
-	// 4. the GPGC
-
-	if ( m_GPGC )
-	{
-		NumFDs += m_GPGC->SetFD( &fd, &send_fd, &nfds );
-	}
-
-	// 5. the potential sockets
-
-	for(vector<CPotentialSocket *>::iterator i = m_Potentials.begin( ) ; i!=m_Potentials.end( );i++ )
-	{
-		NumFDs += (*i)->SetFD( &fd, &send_fd , &nfds );
+	// 8. the bnftps
+	for(vector<CWC3 * > ::iterator i = m_Connections.begin( ) ; i != m_Connections.end( ); i++)
+	{	
+		NumFDs += (*i)->SetFD(&fd,&send_fd,&nfds);
 	}
 
 
@@ -403,1125 +448,118 @@ bool CGProxy :: Update( long usecBlock )
 	if( NumFDs == 0 )
 		MILLISLEEP( 50 );
 
-	// accept warcraft 3 connections
-	CTCPSocket *NewSocket = m_WC3Server->Accept( &fd );
-	/*if (CNewSocket)
-	{
-		m_WC3Connections.push_back( new CW3CC( CNewSocket, m_Server ,6112,m_GIndicator,m_Port +(uint16_t)m_WC3Connections.size( )+ 1));
-	}*/
-	if ( NewSocket )
-	{
-		m_Potentials.push_back( new CPotentialSocket( this, NewSocket, m_Server, 6112 ) );
-		CONSOLE_Print("[WC3Server : " + NewSocket->GetIPString( ) +" ] new connection request accepted");
-	}
+	//
+	// accept new connections
+	//
 
-	NewSocket = m_GameServer->Accept( &fd );
-	if ( NewSocket )
+	CTCPSocket *NewSocket = m_LocalServer->Accept( &fd );
+
+	if( NewSocket )
 	{
-		if ( m_W3CC )
+		if( m_LocalSocket )
 		{
-			if ( m_GPGC )
-			{
-				// connection already exists
-				delete NewSocket;
-			}
-			else
-			{
-				m_GPGC = new CGPG( NewSocket,m_W3CC->GetGames( ) );
-			}
-		}
-		else
-		{
-			CONSOLE_Print("[GAMESERVER] Game connection discared because there is no active W3CC" );
+			// someone's already connected, reject the new connection
+			// we only allow one person to use the proxy at a time
+
 			delete NewSocket;
 		}
-	}
-
-	if ( m_W3CC )
-	{
-		if ( m_W3CC->Update( &fd, &send_fd ) )
-		{
-			delete m_W3CC;
-			m_W3CC = NULL;
-		}
-	}
-
-	if ( m_GPGC )
-	{
-		if ( m_GPGC->Update( &fd , &send_fd ) )
-		{
-			delete m_GPGC;
-			m_GPGC = NULL;
-		}
-	}
-
-	for ( vector<CPotentialSocket *> ::iterator i = m_Potentials.begin( ) ; i != m_Potentials.end( ); )
-	{
-		if ( (*i)->Update( &fd , &send_fd ) )
-		{
-			delete *i;
-			i = m_Potentials.erase( i) ;
-		}
 		else
-			i++;
-	}
-
-	return m_Exiting;
-}
-
-
-//
-// CIncomingGameHost
-//
-
-uint32_t CIncomingGameHost :: NextUniqueGameID = 1;
-
-CIncomingGameHost :: CIncomingGameHost( uint16_t nGameType, uint16_t nParameter, uint32_t nLanguageID, uint16_t nPort, BYTEARRAY &nIP, uint32_t nStatus, uint32_t nElapsedTime, string nGameName,BYTEARRAY nGamePassword, unsigned char nSlotsTotal,unsigned char nSlotsTotalRAW, uint32_t nHostCounter,BYTEARRAY nHostCounterRAW, BYTEARRAY &nStatString )
-{
-	m_GameType = nGameType;
-	m_Parameter = nParameter;
-	m_LanguageID = nLanguageID;
-	m_Port = nPort;
-	m_IP = nIP;
-	m_Status = nStatus;
-	m_ElapsedTime = nElapsedTime;
-	m_GameName = nGameName;
-	m_SlotsTotal = nSlotsTotal;
-	m_HostCounter = nHostCounter;
-	m_StatString = nStatString;
-	m_UniqueGameID = NextUniqueGameID++;
-	m_ReceivedTime = GetTime( );
-	m_GamePassword = nGamePassword;
-	m_HostCounterRAW = nHostCounterRAW;
-	m_SlotsTotalRAW = nSlotsTotalRAW;
-
-	// decode stat string
-
-	BYTEARRAY StatString = UTIL_DecodeStatString( m_StatString );
-	BYTEARRAY MapFlags;
-	BYTEARRAY MapWidth;
-	BYTEARRAY MapHeight;
-	BYTEARRAY MapCRC;
-	BYTEARRAY MapPath;
-	BYTEARRAY HostName;
-
-	if( StatString.size( ) >= 14 )
-	{
-		unsigned int i = 13;
-		MapFlags = BYTEARRAY( StatString.begin( ), StatString.begin( ) + 4 );
-		MapWidth = BYTEARRAY( StatString.begin( ) + 5, StatString.begin( ) + 7 );
-		MapHeight = BYTEARRAY( StatString.begin( ) + 7, StatString.begin( ) + 9 );
-		MapCRC = BYTEARRAY( StatString.begin( ) + 9, StatString.begin( ) + 13 );
-		MapPath = UTIL_ExtractCString( StatString, 13 );
-		i += MapPath.size( ) + 1;
-
-		m_MapFlags = UTIL_ByteArrayToUInt32( MapFlags, false );
-		m_MapWidth = UTIL_ByteArrayToUInt16( MapWidth, false );
-		m_MapHeight = UTIL_ByteArrayToUInt16( MapHeight, false );
-		m_MapCRC = MapCRC;
-		m_MapPath = string( MapPath.begin( ), MapPath.end( ) );
-
-		if( StatString.size( ) >= i + 1 )
 		{
-			HostName = UTIL_ExtractCString( StatString, i );
-			m_HostName = string( HostName.begin( ), HostName.end( ) );
+			CONSOLE_Print( "[GPROXY] local player connected" );
+			m_LocalSocket = NewSocket;
+			m_LocalSocket->SetNoDelay( true );
+			m_TotalPacketsReceivedFromLocal = 0;
+			m_TotalPacketsReceivedFromRemote = 0;
+			m_GameIsReliable = false;
+			m_GameStarted = false;
+			m_LeaveGameSent = false;
+			m_ActionReceived = false;
+			m_Synchronized = true;
+			m_ReconnectPort = 0;
+			m_PID = 255;
+			m_ChatPID = 255;
+			m_ReconnectKey = 0;
+			m_NumEmptyActions = 0;
+			m_NumEmptyActionsUsed = 0;
+			m_LastAckTime = 0;
+			m_LastActionTime = 0;
+			m_JoinedName.clear( );
+			m_HostName.clear( );
+
+			while( !m_PacketBuffer.empty( ) )
+			{
+				delete m_PacketBuffer.front( );
+				m_PacketBuffer.pop( );
+			}
 		}
 	}
-}
 
-CIncomingGameHost :: ~CIncomingGameHost( )
-{
-}
-
-BYTEARRAY CIncomingGameHost :: GetData(string indicator,uint16_t port )
-{
-	BYTEARRAY packet;
-	unsigned char ip[] = {127,0,0,1};
-	unsigned char Zero[] = {0,0,0,0};
-	UTIL_AppendByteArray(packet,m_GameType,false);
-	UTIL_AppendByteArray(packet,m_Parameter,false);
-	UTIL_AppendByteArray(packet,m_LanguageID,false);
-	packet.push_back(2);
-	packet.push_back(0);
-	UTIL_AppendByteArray(packet,port,true);
-	UTIL_AppendByteArray(packet,ip,4);
-	UTIL_AppendByteArray(packet,Zero,4);
-	UTIL_AppendByteArray(packet,Zero,4);
-	UTIL_AppendByteArray(packet,m_Status,false);
-	UTIL_AppendByteArray(packet,m_ElapsedTime,false);
-	if (!(m_Status == 17) )
+	if( m_LocalSocket )
 	{
-		if( m_MapWidth == 1984 && m_MapHeight == 1984 )
+		//
+		// handle proxying (reconnecting, etc...)
+		//
+
+		if( m_LocalSocket->HasError( ) || !m_LocalSocket->GetConnected( ) )
 		{
-			string GameName = indicator + m_GameName.substr(0,m_GameName.size( ) - indicator.size( ));
-			UTIL_AppendByteArrayFast(packet,GameName,true);
+			CONSOLE_Print( "[GPROXY] local player disconnected" );
+
+			delete m_LocalSocket;
+			m_LocalSocket = NULL;
+
+			// ensure a leavegame message was sent, otherwise the server may wait for our reconnection which will never happen
+			// if one hasn't been sent it's because Warcraft III exited abnormally
+
+			if( m_GameIsReliable && !m_LeaveGameSent )
+			{
+				// note: we're not actually 100% ensuring the leavegame message is sent, we'd need to check that DoSend worked, etc...
+
+				BYTEARRAY LeaveGame;
+				LeaveGame.push_back( 0xF7 );
+				LeaveGame.push_back( 0x21 );
+				LeaveGame.push_back( 0x08 );
+				LeaveGame.push_back( 0x00 );
+				UTIL_AppendByteArray( LeaveGame, (uint32_t)PLAYERLEAVE_GPROXY, false );
+				m_RemoteSocket->PutBytes( LeaveGame );
+				m_RemoteSocket->DoSend( &send_fd );
+			}
+
+			m_RemoteSocket->Reset( );
+			m_RemoteSocket->SetNoDelay( true );
+			m_RemoteServerIP.clear( );
+			m_RemoteServerPort = 0;
 		}
 		else
 		{
-			UTIL_AppendByteArrayFast(packet,m_GameName,true);
-		}
-	}
-	else
-	{
-		UTIL_AppendByteArrayFast(packet,m_GameName,true);
-	}
-	string pwd = string(m_GamePassword.begin( ),m_GamePassword.end( ));
-	UTIL_AppendByteArrayFast(packet,pwd);
-	packet.push_back(m_SlotsTotalRAW);
-	UTIL_AppendByteArray(packet,m_HostCounterRAW);
-    string StatString = string(m_StatString.begin( ),m_StatString.end( ));
-	UTIL_AppendByteArrayFast(packet,StatString);
-	return packet;
-}
-string CIncomingGameHost :: GetIPString( )
-{
-	string Result;
+			m_LocalSocket->DoRecv( &fd );
+			ExtractLocalPackets( );
+			ProcessLocalPackets( );
 
-	if( m_IP.size( ) >= 4 )
-	{
-		for( unsigned int i = 0; i < 4; i++ )
-		{
-			Result += UTIL_ToString( (unsigned int)m_IP[i] );
-
-			if( i < 3 )
-				Result += ".";
-		}
-	}
-
-	return Result;
-}
-
-
-
-/////////////////
-////  WC3    ////
-/////////////////
-
-/// cproxy
-
-CProxy :: CProxy ( CTCPSocket * socket, string hostname, uint16_t port ,bool connect,string ConsoleSender )
-{
-	m_LocalSocket = socket;
-	m_RemoteHost = hostname;
-	m_Exiting = false;
-	m_RemotePort = port;
-	m_ConsoleSender = ConsoleSender;
-	if( connect )
-	{
-		m_RemoteSocket = new CTCPClient( );
-		m_RemoteSocket->SetNoDelay( true );
-		m_RemoteSocket->Connect( string ( ), hostname,port );
-		CONSOLE_Print("["+m_ConsoleSender+"] remote connection started for " + hostname );
-	}
-	else
-		m_RemoteSocket = NULL;
-}
-CProxy :: CProxy( CTCPSocket * Local,CTCPClient *Remote )
-{
-	m_LocalSocket = Local;
-	m_RemoteSocket = Remote;
-	m_Exiting = false;
-}
-CProxy :: ~CProxy()
-{
-	if ( m_Dispose )
-	{
-		delete m_LocalSocket;
-		delete m_RemoteSocket;
-	}
-}
-unsigned int CProxy::SetFD(void *fd, void *send_fd, int *nfds)
-{
-	unsigned int NumFDs = 0;
-	if ( !m_LocalSocket->HasError( ) && m_LocalSocket->GetConnected( ) )
-	{
-		m_LocalSocket->SetFD( (fd_set * ) fd, ( fd_set * ) send_fd , nfds );
-		NumFDs++;
-	}
-	if( m_RemoteSocket )
-	{
-		if ( !m_RemoteSocket->HasError( )  && m_RemoteSocket->GetConnected( ) )
-		{
-			m_RemoteSocket->SetFD( ( fd_set * ) fd, ( fd_set * ) send_fd , nfds );
-			NumFDs++;
-		}
-	}
-	return NumFDs;
-}
-bool CProxy ::Update(void *fd, void *send_fd)
-{
-	if ( m_LocalSocket->HasError( ) )
-	{
-		CONSOLE_Print( "[" + m_ConsoleSender + "] local socket disconnected due to socket error ");
-		m_Exiting = true;
-		m_RemoteSocket->Disconnect( );
-	}
-	else if ( !m_LocalSocket->GetConnected( ) )
-	{
-		CONSOLE_Print( "[" + m_ConsoleSender + "] local socket disconnected");
-		m_Exiting = true;
-		m_RemoteSocket->Disconnect( );	
-	}
-	else if ( m_LocalSocket->GetConnected( ) )
-	{
-		m_LocalSocket->DoRecv( (fd_set * )fd );
-		OnLocalDataArrival( );
-	    m_LocalSocket->DoSend( (fd_set * ) send_fd );
-	}
-
-	if ( m_RemoteSocket )
-	{	
-		if ( m_RemoteSocket->HasError( ) )
-		{
-			CONSOLE_Print( "[" + m_ConsoleSender + "] remote socket disconnected due to socket error ");
-			m_Exiting = true;
-			m_LocalSocket->Disconnect( );
-		}
-		else if ( !m_RemoteSocket->GetConnected( ) && !m_RemoteSocket->GetConnecting( ) )
-		{
-			CONSOLE_Print( "[" + m_ConsoleSender + "] remote socket disconnected ");
-			m_Exiting = true;
-			m_LocalSocket->Disconnect( );
-		}
-		else if ( m_RemoteSocket->GetConnecting( ))
-		{
-			if ( m_RemoteSocket->CheckConnect( ) )
+			if( !m_RemoteServerIP.empty( ) )
 			{
-				CONSOLE_Print("[" +m_ConsoleSender +"] remote socket connected with [" + m_RemoteSocket->GetIPString( ) +"]");
-				OnRemoteConnect( );
-			}
-		}
-		if ( m_RemoteSocket->GetConnected( ) )
-		{
-			m_RemoteSocket->DoRecv( (fd_set *) fd );
-			OnRemoteDataArrival(  );
-			
-			m_RemoteSocket->DoSend( (fd_set * ) send_fd );
-		}
-	}
-	return m_Exiting;
-}
-void CProxy :: OnLocalDataArrival()
-{
-	string *RecvBuffer = m_LocalSocket->GetBytes( );
-	BYTEARRAY data = UTIL_CreateByteArray( (unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ));
-	if ( !m_RemoteSocket->GetConnected( ) )
-	{
-		m_PacketBuffer.push( data );
-		m_LocalSocket->ClearRecvBuffer( );
-	}
-	else
-	{
-		m_RemoteSocket->PutBytes( data );
-		m_LocalSocket->ClearRecvBuffer( );
-
-	}
-}
-void CProxy :: OnRemoteDataArrival( )
-{
-	string *RecvBuffer = m_RemoteSocket->GetBytes( );
-	m_LocalSocket->PutBytes( *RecvBuffer );
-	m_RemoteSocket->ClearRecvBuffer( );
-}
-void CProxy :: OnRemoteConnect( )
-{
-	while ( !m_PacketBuffer.empty( ) )
-	{
-		m_RemoteSocket->PutBytes( m_PacketBuffer.front( ) );
-		m_PacketBuffer.pop( );
-	}
-}
-
-
-/// potential socket
-CPotentialSocket::CPotentialSocket(CGProxy *gproxy, CTCPSocket *socket, string hostname, uint16_t port): CProxy(socket,hostname,port,false,"PotentialSocket")
-{
-	m_GProxy = gproxy;
-}
-CPotentialSocket::~CPotentialSocket( )
-{
-}
-void CPotentialSocket ::OnLocalDataArrival( )
-{
-	string *RecvBuffer = m_LocalSocket->GetBytes( );
-	BYTEARRAY data = UTIL_CreateByteArray((unsigned char *)RecvBuffer->c_str( ),RecvBuffer->size( ) );
-	if ( data.size( ) > 0 )
-	{
-		if ( data[0] == 1)
-		{
-			// wc3 connection
-			m_ConsoleSender = "W3CC";
-			Print("connection marked as Warcraft III Client Connection ( W3CC )");
-			m_RemoteSocket = new CTCPClient( );
-			m_RemoteSocket->SetNoDelay(true);
-			m_RemoteSocket->Connect( string( ) ,m_RemoteHost,6112 );
-			m_PacketBuffer.push( data );
-			m_LocalSocket->ClearRecvBuffer( );
-			m_GProxy->m_W3CC =  new CW3CC( m_LocalSocket,m_RemoteSocket,m_RemoteHost,m_GProxy, m_PacketBuffer );
-			m_Exiting = true;
-			m_Dispose = false;
-		}
-		else if ( data[0] == 2 )
-		{
-			if ( !m_RemoteSocket )
-			{
-				m_ConsoleSender = "BNFTP";
-				Print("connection marked as Battle.Net's FTP ( BNFTP )");
-				m_RemoteSocket->Connect( string( ), m_RemoteHost,6112);
-				m_PacketBuffer.push( data );
-				m_LocalSocket->ClearRecvBuffer( );
-			}
-			else
-				m_RemoteSocket->PutBytes( data );
-			    m_LocalSocket->ClearRecvBuffer( );
-		}
-		else if ( data[0] == 247 )
-		{
-			if ( !m_RemoteSocket )
-			{
-				string GameName = m_GProxy->m_GPGC->GetGameName( );
-				vector<CIncomingGameHost *> Games = m_GProxy->m_W3CC->GetGames( );
-				for ( vector<CIncomingGameHost *>::iterator i = Games.begin( ); i != Games.end( );i++ )
+				if( m_GameIsReliable && m_ActionReceived && GetTime( ) - m_LastActionTime >= 60 )
 				{
-					if ( (*i)->GetGameName( ) == GameName )
+					if( m_NumEmptyActionsUsed < m_NumEmptyActions )
 					{
-
-						m_RemoteSocket = new CTCPClient( );
-						m_RemoteSocket->SetNoDelay(true);
-						m_RemoteSocket->Connect( string( ) ,(*i)->GetIPString( ),6112 );
-						m_ConsoleSender = "GCA";
-						Print("connection marked as Game Client Accounce ( GCA )");
-						m_PacketBuffer.push(data);
-						m_LocalSocket->ClearRecvBuffer( );
-					}
-				}
-			}
-			else
-			{
-				m_RemoteSocket->PutBytes(data);
-				m_LocalSocket->ClearRecvBuffer( );
-			}
-		}
-	}
-}
-CW3CC :: CW3CC(CTCPSocket *socket,CTCPClient *remote,string Server,CGProxy *gproxy,queue<BYTEARRAY > packetbuffer ) : CProxy( socket,remote)
-{
-	m_GProxy = gproxy;
-	m_PacketBuffer = packetbuffer;
-	m_Server = Server;
-	m_GIndicator = m_GProxy->m_GIndicator;
-	m_ConsoleSender = "W3CC";
-	m_Dispose = true;
-}
-CW3CC ::~CW3CC( )
-{ 
-}
-
-void CW3CC :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
-{
-	// DEBUG_Print( "RECEIVED SID_GETADVLISTEX" );
-	// DEBUG_Print( data );
-
-	// 2 bytes					-> Header
-	// 2 bytes					-> Length
-	// 4 bytes					-> GamesFound
-	// for( 1 .. GamesFound )
-	//		2 bytes				-> GameType
-	//		2 bytes				-> Parameter
-	//		4 bytes				-> Language ID
-	//		2 bytes				-> AF_INET
-	//		2 bytes				-> Port
-	//		4 bytes				-> IP
-	//		4 bytes				-> zeros
-	//		4 bytes				-> zeros
-	//		4 bytes				-> Status
-	//		4 bytes				-> ElapsedTime
-	//		null term string	-> GameName
-	//		1 byte				-> GamePassword
-	//		1 byte				-> SlotsTotal
-	//		8 bytes				-> HostCounter (ascii hex format)
-	//		null term string	-> StatString
-
-	vector<CIncomingGameHost *> Games;
-	if( ValidateLength( data ) && data.size( ) >= 8 )
-	{
-		unsigned int i = 8;
-		uint32_t GamesFound = UTIL_ByteArrayToUInt32( data, false, 4 );
-		if ( GamesFound == 0 )
-		{
-			BYTEARRAY packet;
-			packet.push_back(255);
-			packet.push_back(SID_GETADVLISTEX);
-			packet.push_back(0);
-			packet.push_back(0);
-			UTIL_AppendByteArray(packet,GamesFound,false);
-			UTIL_AppendByteArray(packet,UTIL_ByteArrayToUInt32(data,false,8),false);
-			AssignLength(packet);
-			m_LocalSocket->PutBytes(packet);
-			return;
-		}
-		while( GamesFound > 0 )
-		{
-			unsigned char ip[] = {127,0,0,1};
-			GamesFound--;
-
-			if( data.size( ) < i + 33 )
-				break;
-			uint16_t GameType = UTIL_ByteArrayToUInt16( data, false, i );
-			i += 2;
-			uint16_t Parameter = UTIL_ByteArrayToUInt16( data, false, i );
-			i += 2;
-			uint32_t LanguageID = UTIL_ByteArrayToUInt32( data, false, i );
-			i += 4;
-			// AF_INET
-			i += 2;
-			uint16_t Port = UTIL_ByteArrayToUInt16( data, true, i );
-			i += 2;
-			BYTEARRAY IP = BYTEARRAY( data.begin( ) + i, data.begin( ) + i + 4 );
-			i += 4;
-			// zeros
-			i += 4;
-			// zeros
-			i += 4;
-			uint32_t Status = UTIL_ByteArrayToUInt32( data, false, i );
-			i += 4;
-			uint32_t ElapsedTime = UTIL_ByteArrayToUInt32( data, false, i );
-			i += 4;
-			BYTEARRAY GameName = UTIL_ExtractCString( data, i );
-			int t = i;
-			i += GameName.size( ) + 1;
-
-			if( data.size( ) < i + 1 )
-				break;
-
-			BYTEARRAY GamePassword = UTIL_ExtractCString( data, i );
-			i += GamePassword.size( ) + 1;
-
-			if( data.size( ) < i + 10 )
-				break;
-
-			// SlotsTotal is in ascii hex format
-
-			unsigned char SlotsTotal = data[i];
-			unsigned int c;
-			stringstream SS;
-			SS << string( 1, SlotsTotal );
-			SS >> hex >> c;
-			i++;
-
-			// HostCounter is in reverse ascii hex format
-			// e.g. 1  is "10000000"
-			// e.g. 10 is "a0000000"
-			// extract it, reverse it, parse it, construct a single uint32_t
-
-			BYTEARRAY HostCounterRaw = BYTEARRAY( data.begin( ) + i, data.begin( ) + i + 8 );
-			string HostCounterString = string( HostCounterRaw.rbegin( ), HostCounterRaw.rend( ) );
-			uint32_t HostCounter = 0;
-
-			for( int j = 0; j < 4; j++ )
-			{
-				unsigned int c;
-				stringstream SS;
-				SS << HostCounterString.substr( j * 2, 2 );
-				SS >> hex >> c;
-				HostCounter |= c << ( 24 - j * 8 );
-			}
-
-			i += 8;
-			BYTEARRAY StatString = UTIL_ExtractCString( data, i );
-			i += StatString.size( ) + 1;
-			CIncomingGameHost *Game = new CIncomingGameHost( GameType, Parameter, LanguageID, Port, IP, Status, ElapsedTime, string( GameName.begin( ), GameName.end( ) ),GamePassword,c, SlotsTotal, HostCounter,HostCounterRaw, StatString );
-			Games.push_back( Game );
-		}
-	}
-	m_Games = Games;
-
-	BYTEARRAY packet;
-	packet.push_back(255);
-    packet.push_back(SID_GETADVLISTEX);
-	packet.push_back(0);
-	packet.push_back(0);
-	UTIL_AppendByteArray(packet,(uint32_t)m_Games.size( ),false);
-	for( vector<CIncomingGameHost *> :: iterator i = m_Games.begin( ); i != m_Games.end( ); i++ )
-	{
-		UTIL_AppendByteArray(packet,(*i)->GetData(m_GIndicator,m_GProxy->m_Port ));
-	}
-	AssignLength(packet);
-	m_LocalSocket->PutBytes(packet);
-}
-void CW3CC :: Handle_SID_CHATEVENT(BYTEARRAY data)
-{
-	// DEBUG_Print( "RECEIVED SID_CHATEVENT" );
-	// DEBUG_Print( data );
-
-	// 2 bytes					-> Header
-	// 2 bytes					-> Length
-	// 4 bytes					-> EventID
-	// 4 bytes					-> ???
-	// 4 bytes					-> Ping
-	// 12 bytes					-> ???
-	// null terminated string	-> User
-	// null terminated string	-> Message
-
-	if( ValidateLength( data ) && data.size( ) >= 29 )
-	{
-		BYTEARRAY EventID = BYTEARRAY( data.begin( ) + 4, data.begin( ) + 8 );
-		BYTEARRAY Ping = BYTEARRAY( data.begin( ) + 12, data.begin( ) + 16 );
-		BYTEARRAY Username = UTIL_ExtractCString( data, 28 );
-		BYTEARRAY message = UTIL_ExtractCString( data, Username.size( ) + 29 );
-		string User = string(Username.begin( ),Username.end( ));
-		string Message = string(message.begin( ),message.end( ));
-		switch (UTIL_ByteArrayToUInt32(EventID,false))
-		{
-		case EID_TALK: CONSOLE_Print("[LOCAL] ["+User+"] "+ Message); break;
-		case EID_WHISPER: CONSOLE_Print("[WHISPER] ["+User+"] "+ Message); break;
-		case EID_EMOTE:  CONSOLE_Print("[EMOTE] ["+User+"] "+ Message); break;
-		case EID_CHANNEL: CONSOLE_Print("[BNET] joined channel ["+Message+"]"); break;
-		case EID_INFO : CONSOLE_Print("[INFO] "+Message); break;
-		case EID_ERROR: CONSOLE_Print("[ERROR] " +Message); break;
-		case EID_WHISPERSENT: CONSOLE_Print("[WHISPERED] ["+ User +"] " + Message); break;
-		}
-	}
-}
-void CW3CC :: Handle_SID_CHATCOMMAND(BYTEARRAY data)
-{
-	if (ValidateLength(data))
-	{
-	    BYTEARRAY msg = UTIL_ExtractCString(data,4);
-		string Message = string(msg.begin( ),msg.end( ));
-		if ( ProcessCommand(Message) )
-		{
-			m_RemoteSocket->PutBytes(data);
-		}
-	}
-}
-void CW3CC :: Handle_SID_NOTIFYJOIN( BYTEARRAY data )
-{/*
-	(DWORD) Product ID *
-	(DWORD) Product version
-	(STRING) Game Name
-	(STRING) Game Password*/
-
-	BYTEARRAY ProductID = BYTEARRAY( data.begin( ) + 4 , data.begin( ) + 8 );
-	BYTEARRAY ProductVersion = BYTEARRAY( data.begin( ) + 8,data.begin( ) + 12 );
-	BYTEARRAY GameName = UTIL_ExtractCString( data, 12 );
-	string Gamename = string(GameName.begin( ), GameName.end( ) );
-	
-	if ( Gamename.size( ) >= m_GIndicator.size( ) && Gamename.substr( 0,m_GIndicator.size( )) == m_GIndicator  )
-	{
-		Gamename = Gamename.substr( m_GIndicator.size( ) );
-		for(vector<CIncomingGameHost *>::iterator i = m_Games.begin( ) ; i != m_Games.end( ) ; i++ )
-		{
-			if ( (*i)->GetGameName( ).size( ) > Gamename.size( ) && (*i)->GetGameName( ).substr(0,Gamename.size( )) == Gamename )
-			{
-				Gamename = (*i)->GetGameName( );
-				CONSOLE_Print("[GPROXY] Sending notification for game [" +Gamename +"]");
-				break;
-			}
-		}
-	}
-	//construct the packet;
-	BYTEARRAY packet;
-	packet.push_back(255);
-	packet.push_back(SID_NOTIFYJOIN);
-	packet.push_back(0);
-	packet.push_back(0);
-	UTIL_AppendByteArray( packet, ProductID );
-	UTIL_AppendByteArray( packet, ProductVersion );
-	UTIL_AppendByteArrayFast( packet, Gamename );
-	packet.push_back(0);
-	AssignLength(packet);
-	m_RemoteSocket->PutBytes(packet);
-
-}
-bool CW3CC :: ProcessCommand(string Message)
-{
-	string Command;
-	string Payload;
-	string :: size_type PayloadStart = Message.find( " " );
-	if( PayloadStart != string :: npos )
-	{
-		Command = Message.substr( 1, PayloadStart - 1 );
-		Payload = Message.substr( PayloadStart + 1 );
-	}
-	else
-		Command = Message.substr( 1 );
-
-	transform( Command.begin( ), Command.end( ), Command.begin( ), (int(*)(int))tolower );
-
-	bool forward = true; // if forward == true the chatcommand will be sent to bnet
-	if (Command == "version" && Payload.empty( ))
-	{
-		SendLocalChat("GProxy++ Version " + gGProxy->m_Version );
-		forward = false;
-	}
-	else if ((Command == "setindicator" || Command =="si") && !Payload.empty( ))
-	{
-		m_GIndicator = Payload;
-		SendLocalChat("Indicator is now set to "+ Payload );
-		forward = false;
-	}
-	else if (Command == "indicator" )
-	{
-		SendLocalChat("Indicator: "+ m_GIndicator );
-		forward = false;
-	}
-	return forward;
-}
-
-
-
-void CW3CC :: ExtractWC3Packets( )
-{
-	string *RecvBuffer = m_LocalSocket->GetBytes( );
-	BYTEARRAY Bytes = UTIL_CreateByteArray((unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ) );
-	// a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
-	while( Bytes.size( ) >= 4 )
-	{
-			// byte 0 is always 255
-            
-			if( Bytes[0] == 255)
-			{
-					// bytes 2 and 3 contain the length of the packet
-
-					uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
-
-					if( Length >= 4 )
-					{
-							if( Bytes.size( ) >= Length )
-							{
-									BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
-									m_LocalPackets.push( new CCommandPacket( 255,Bytes[1], Data) );
-									*RecvBuffer = RecvBuffer->substr( Length );
-									Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
-							}
-							else
-									return;
+						SendEmptyAction( );
+						m_NumEmptyActionsUsed++;
 					}
 					else
 					{
-						   Print("received invalid packet from wc3 (bad length)" );
-							return;
-					}
-			}
-			else
-			{
-					Print("received invalid packet from wc3 (bad header constant)" );
-					return;
-			}
-	}
-}
-void CW3CC :: ProcessWC3Packets( )
-{
-	queue<CCommandPacket *> temp;
-	bool forward = true;
-	while (!m_LocalPackets.empty( ) )
-	{
-		forward = true;
-		CCommandPacket *packet = m_LocalPackets.front( );
-		m_LocalPackets.pop( );
-        switch (packet->GetID( ))
-        {
-             case SID_CHATCOMMAND : Handle_SID_CHATCOMMAND(packet->GetData( )); forward = false; break;
-			 case SID_NOTIFYJOIN : Handle_SID_NOTIFYJOIN(packet->GetData( ) ); forward = false; break;
-        }
-        if (forward)
-        {
-			if (m_RemoteSocket->GetConnected( ) )
-			{
-			  m_RemoteSocket->PutBytes(packet->GetData( ));
-			}
-			else
-			{
-				temp.push( packet );
-			}
-        }
-	}
-	m_LocalPackets = temp;
-}
-void CW3CC :: ExtractBNETPackets( )
-{
-	string *RecvBuffer = m_RemoteSocket->GetBytes( );
-	BYTEARRAY Bytes = UTIL_CreateByteArray((unsigned char * )RecvBuffer->c_str( ),RecvBuffer->size( ) );
-    // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
-    while( Bytes.size( ) >= 4 )
-    {
-            // byte 0 is always 255
-            
-            if( Bytes[0] == 255 )
-            {
-                    // bytes 2 and 3 contain the length of the packet
-
-                    uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
-
-                    if( Length >= 4 )
-                    {
-                            if( Bytes.size( ) >= Length )
-                            {
-                                BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
-                                m_RemotePackets.push( new CCommandPacket( 255,Bytes[1], Data) );
-								*RecvBuffer = RecvBuffer->substr( Length );
-							    Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
-                            }
-                            else
-                                    return;
-                    }
-                    else
-                    {
-                            Print("received invalid packet from bnet (bad length)" );
-                            return;
-                    }
-            }
-            else
-            {
-                   Print("received invalid packet from bnet (bad header constant)" );
-                    return;
-            }
-    }
-}
-
-void CW3CC :: ProcessBNETPackets( )
-{
-    bool forward = true;
-	while ( !m_RemotePackets.empty( ) )
-	{
-		forward = true;
-		CCommandPacket *packet = m_RemotePackets.front( );
-		m_RemotePackets.pop( );
-        switch (packet->GetID( ))
-        {
-           case SID_GETADVLISTEX : Handle_SID_GETADVLISTEX(packet->GetData( )); forward = false; break;
-           case SID_CHATEVENT : Handle_SID_CHATEVENT(packet->GetData( )); break;
-        }
-        if (forward)
-        {
-           m_LocalSocket->PutBytes(packet->GetData( ));
-        }
-		
-	}
-}
-void CW3CC :: SendLocalChat( string message )
-{
-    // send the message from user gproxy as a whisper using the sid_chatevent packet;
-    string user = "GProxy"; // you can change that to whatever you want
-    BYTEARRAY packet;
-    packet.push_back(255);
-    packet.push_back(SID_CHATEVENT);
-    packet.push_back(0);
-    packet.push_back(0);
-    UTIL_AppendByteArray(packet,(uint32_t)EID_WHISPER,false); // event id
-    UTIL_AppendByteArray(packet,(uint32_t)0,false); // user flags
-    UTIL_AppendByteArray(packet,(uint32_t)0,false); // ping
-    UTIL_AppendByteArray(packet,(uint32_t)0,false); // ipaddress 
-    UTIL_AppendByteArray(packet,(uint32_t)0,false); // account number
-    UTIL_AppendByteArray(packet,(uint32_t)0,false); // registration authority
-    UTIL_AppendByteArrayFast(packet,user); // username
-    UTIL_AppendByteArrayFast(packet,message); // message
-    AssignLength(packet);
-    m_LocalSocket->PutBytes(packet);
-}
-
-void CW3CC :: SendChatCommand( string message )
-{
-    BYTEARRAY packet;
-    packet.push_back(255);
-    packet.push_back(SID_CHATCOMMAND);
-    packet.push_back(0);
-    packet.push_back(0);
-    UTIL_AppendByteArrayFast(packet,message);
-    AssignLength(packet);
-    m_RemoteSocket->PutBytes(packet);
-}
-bool CW3CC :: AssignLength( BYTEARRAY &content )
-{
-	// insert the actual length of the content array into bytes 3 and 4 (indices 2 and 3)
-
-	BYTEARRAY LengthBytes;
-
-	if( content.size( ) >= 4 && content.size( ) <= 65535 )
-	{
-		LengthBytes = UTIL_CreateByteArray( (uint16_t)content.size( ), false );
-		content[2] = LengthBytes[0];
-		content[3] = LengthBytes[1];
-		return true;
-	}
-
-	return false;
-}
-
-bool CW3CC :: ValidateLength( BYTEARRAY &content )
-{
-	// verify that bytes 3 and 4 (indices 2 and 3) of the content array describe the length
-
-	uint16_t Length;
-	BYTEARRAY LengthBytes;
-
-	if( content.size( ) >= 4 && content.size( ) <= 65535 )
-	{
-		LengthBytes.push_back( content[2] );
-		LengthBytes.push_back( content[3] );
-		Length = UTIL_ByteArrayToUInt16( LengthBytes, false );
-
-		if( Length == content.size( ) )
-			return true;
-	}
-
-	return false;
-}
-
-
-////////////////////////
-/// GProxy Game (GPG)/// 
-////////////////////////
-CGPG ::CGPG(CTCPSocket *socket, std::vector<CIncomingGameHost *> games)
-{
-	m_LocalSocket = socket;
-	m_Games = games;
-	m_RemoteSocket = new CTCPClient( );
-	m_RemoteSocket->SetNoDelay( true );
-	m_GameProtocol = new CGameProtocol( gGProxy );
-	m_GPSProtocol = new CGPSProtocol( );
-	m_TotalPacketsReceivedFromLocal = 0;
-	m_TotalPacketsReceivedFromRemote = 0;
-	m_LastConnectionAttemptTime = 0;
-	m_LastRefreshTime = 0;
-	m_RemoteServerPort = 0;
-	m_GameIsReliable = false;
-	m_GameStarted = false;
-	m_LeaveGameSent = false;
-	m_ActionReceived = false;
-	m_Synchronized = true;
-	m_ReconnectPort = 0;
-	m_PID = 255;
-	m_ChatPID = 255;
-	m_ReconnectKey = 0;
-	m_NumEmptyActions = 0;
-	m_NumEmptyActionsUsed = 0;
-	m_LastAckTime = 0;
-	m_LastActionTime = 0;
-	m_GameName = "";
-}
-
-CGPG ::~CGPG( )
-{
-	delete m_LocalSocket;
-	delete m_RemoteSocket;
-	for( vector<CIncomingGameHost *> :: iterator i = m_Games.begin( ); i != m_Games.end( ); i++ )
-		delete *i;
-	delete m_GameProtocol;
-	delete m_GPSProtocol;
-
-	while( !m_LocalPackets.empty( ) )
-	{
-		delete m_LocalPackets.front( );
-		m_LocalPackets.pop( );
-	}
-
-	while( !m_RemotePackets.empty( ) )
-	{
-		delete m_RemotePackets.front( );
-		m_RemotePackets.pop( );
-	}
-
-	while( !m_PacketBuffer.empty( ) )
-	{
-		delete m_PacketBuffer.front( );
-		m_PacketBuffer.pop( );
-	}
-}
-unsigned int CGPG ::SetFD( void *fd, void *send_fd, int *nfds )
-{
-	unsigned int NumFDs = 0;
-	if ( !m_LocalSocket->HasError( ) && m_LocalSocket->GetConnected( ) )
-	{ 
-		m_LocalSocket->SetFD( (fd_set *)fd, (fd_set *)send_fd, nfds );
-		NumFDs++;
-	}
-	if ( !m_RemoteSocket->HasError( ) && m_RemoteSocket->GetConnected( ) )
-	{
-		m_RemoteSocket->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
-		NumFDs++;
-	}
-	return NumFDs;
-}
-bool CGPG ::Update( void *fd, void *send_fd )
-{
-
-	if( m_LocalSocket->HasError( ) || !m_LocalSocket->GetConnected( ) )
-	{
-		CONSOLE_Print( "[GPROXY] local player disconnected" );
-	
-		// ensure a leavegame message was sent, otherwise the server may wait for our reconnection which will never happen
-		// if one hasn't been sent it's because Warcraft III exited abnormally
-
-		if( m_GameIsReliable && !m_LeaveGameSent )
-		{
-			// note: we're not actually 100% ensuring the leavegame message is sent, we'd need to check that DoSend worked, etc...
-
-			BYTEARRAY LeaveGame;
-			LeaveGame.push_back( 0xF7 );
-			LeaveGame.push_back( 0x21 );
-			LeaveGame.push_back( 0x08 );
-			LeaveGame.push_back( 0x00 );
-			UTIL_AppendByteArray( LeaveGame, (uint32_t)PLAYERLEAVE_GPROXY, false );
-			m_RemoteSocket->PutBytes( LeaveGame );
-			m_RemoteSocket->DoSend( (fd_set *)send_fd );
-		}
-		return true;
-	}
-	else
-	{
-		m_LocalSocket->DoRecv( (fd_set *)fd );
-		ExtractLocalPackets( );
-		ProcessLocalPackets( );
-
-		if( !m_RemoteServerIP.empty( ) )
-		{
-			if( m_GameIsReliable && m_ActionReceived && GetTime( ) - m_LastActionTime >= 60 )
-			{
-				if( m_NumEmptyActionsUsed < m_NumEmptyActions )
-				{
-					SendEmptyAction( );
-					m_NumEmptyActionsUsed++;
-				}
-				else
-				{
-					SendLocalChat( "GProxy++ ran out of time to reconnect, Warcraft III will disconnect soon." );
-					CONSOLE_Print( "[GPROXY] ran out of time to reconnect" );
-				}
-
-				m_LastActionTime = GetTime( );
-			}
-
-			if( m_RemoteSocket->HasError( ) )
-			{
-				CONSOLE_Print( "[GPROXY] disconnected from remote server due to socket error" );
-
-				if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 )
-				{
-					SendLocalChat( "You have been disconnected from the server due to a socket error." );
-					uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
-
-					if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
-						TimeRemaining = 0;
-
-					SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
-					CONSOLE_Print( "[GPROXY] attempting to reconnect" );
-					m_RemoteSocket->Reset( );
-					m_RemoteSocket->SetNoDelay( true );
-					m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
-					m_LastConnectionAttemptTime = GetTime( );
-				}
-				else
-				{
-					m_LocalSocket->Disconnect( );
-					return true;
-				}
-			}
-
-			if( !m_RemoteSocket->GetConnecting( ) && !m_RemoteSocket->GetConnected( ) )
-			{
-				CONSOLE_Print( "[GPROXY] disconnected from remote server" );
-
-				if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 )
-				{
-					SendLocalChat( "You have been disconnected from the server." );
-					uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
-
-					if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
-						TimeRemaining = 0;
-
-					SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
-					CONSOLE_Print( "[GPROXY] attempting to reconnect" );
-					m_RemoteSocket->Reset( );
-					m_RemoteSocket->SetNoDelay( true );
-					m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
-					m_LastConnectionAttemptTime = GetTime( );
-				}
-				else
-				{
-					m_LocalSocket->Disconnect( );
-					return true;
-				}
-			}
-
-			if( m_RemoteSocket->GetConnected( ) )
-			{
-				if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 && GetTime( ) - m_RemoteSocket->GetLastRecv( ) >= 20 )
-				{
-					CONSOLE_Print( "[GPROXY] disconnected from remote server due to 20 second timeout" );
-					SendLocalChat( "You have been timed out from the server." );
-					uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
-
-					if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
-						TimeRemaining = 0;
-
-					SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
-					CONSOLE_Print( "[GPROXY] attempting to reconnect" );
-					m_RemoteSocket->Reset( );
-					m_RemoteSocket->SetNoDelay( true );
-					m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
-					m_LastConnectionAttemptTime = GetTime( );
-				}
-				else
-				{
-					m_RemoteSocket->DoRecv( (fd_set *)fd );
-					ExtractRemotePackets( );
-					ProcessRemotePackets( );
-
-					if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 && GetTime( ) - m_LastAckTime >= 10 )
-					{
-						m_RemoteSocket->PutBytes( m_GPSProtocol->SEND_GPSC_ACK( m_TotalPacketsReceivedFromRemote ) );
-						m_LastAckTime = GetTime( );
+						SendLocalChat( "GProxy++ ran out of time to reconnect, Warcraft III will disconnect soon." );
+						CONSOLE_Print( "[GPROXY] ran out of time to reconnect" );
 					}
 
-					m_RemoteSocket->DoSend( (fd_set *)send_fd );
+					m_LastActionTime = GetTime( );
 				}
-			}
 
-			if( m_RemoteSocket->GetConnecting( ) )
-			{
-				// we are currently attempting to connect
-
-				if( m_RemoteSocket->CheckConnect( ) )
+				if( m_RemoteSocket->HasError( ) )
 				{
-					// the connection attempt completed
-
-					if( m_GameIsReliable && m_ActionReceived )
-					{
-						// this is a reconnection, not a new connection
-						// if the server accepts the reconnect request it will send a GPS_RECONNECT back requesting a certain number of packets
-
-						SendLocalChat( "GProxy++ reconnected to the server!" );
-						SendLocalChat( "==================================================" );
-						CONSOLE_Print( "[GPROXY] reconnected to remote server" );
-
-						// note: even though we reset the socket when we were disconnected, we haven't been careful to ensure we never queued any data in the meantime
-						// therefore it's possible the socket could have data in the send buffer
-						// this is bad because the server will expect us to send a GPS_RECONNECT message first
-						// so we must clear the send buffer before we continue
-						// note: we aren't losing data here, any important messages that need to be sent have been put in the packet buffer
-						// they will be requested by the server if required
-
-						m_RemoteSocket->ClearSendBuffer( );
-						m_RemoteSocket->PutBytes( m_GPSProtocol->SEND_GPSC_RECONNECT( m_PID, m_ReconnectKey, m_TotalPacketsReceivedFromRemote ) );
-
-						// we cannot permit any forwarding of local packets until the game is synchronized again
-						// this will disable forwarding and will be reset when the synchronization is complete
-
-						m_Synchronized = false;
-					}
-					else
-						CONSOLE_Print( "[GPROXY] connected to remote server" );
-				}
-				else if( GetTime( ) - m_LastConnectionAttemptTime >= 10 )
-				{
-					// the connection attempt timed out (10 seconds)
-
-					CONSOLE_Print( "[GPROXY] connect to remote server timed out" );
+					CONSOLE_Print( "[GPROXY] disconnected from remote server due to socket error" );
 
 					if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 )
 					{
+						SendLocalChat( "You have been disconnected from the server due to a socket error." );
 						uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
 
 						if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
@@ -1537,16 +575,177 @@ bool CGPG ::Update( void *fd, void *send_fd )
 					else
 					{
 						m_LocalSocket->Disconnect( );
-						return true;
+						delete m_LocalSocket;
+						m_LocalSocket = NULL;
+						m_RemoteSocket->Reset( );
+						m_RemoteSocket->SetNoDelay( true );
+						m_RemoteServerIP.clear( );
+						m_RemoteServerPort = 0;
+						return false;
+					}
+				}
+
+				if( !m_RemoteSocket->GetConnecting( ) && !m_RemoteSocket->GetConnected( ) )
+				{
+					CONSOLE_Print( "[GPROXY] disconnected from remote server" );
+
+					if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 )
+					{
+						SendLocalChat( "You have been disconnected from the server." );
+						uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
+
+						if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
+							TimeRemaining = 0;
+
+						SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
+						CONSOLE_Print( "[GPROXY] attempting to reconnect" );
+						m_RemoteSocket->Reset( );
+						m_RemoteSocket->SetNoDelay( true );
+						m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
+						m_LastConnectionAttemptTime = GetTime( );
+					}
+					else
+					{
+						m_LocalSocket->Disconnect( );
+						delete m_LocalSocket;
+						m_LocalSocket = NULL;
+						m_RemoteSocket->Reset( );
+						m_RemoteSocket->SetNoDelay( true );
+						m_RemoteServerIP.clear( );
+						m_RemoteServerPort = 0;
+						return false;
+					}
+				}
+
+				if( m_RemoteSocket->GetConnected( ) )
+				{
+					if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 && GetTime( ) - m_RemoteSocket->GetLastRecv( ) >= 20 )
+					{
+						CONSOLE_Print( "[GPROXY] disconnected from remote server due to 20 second timeout" );
+						SendLocalChat( "You have been timed out from the server." );
+						uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
+
+						if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
+							TimeRemaining = 0;
+
+						SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
+						CONSOLE_Print( "[GPROXY] attempting to reconnect" );
+						m_RemoteSocket->Reset( );
+						m_RemoteSocket->SetNoDelay( true );
+						m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
+						m_LastConnectionAttemptTime = GetTime( );
+					}
+					else
+					{
+						m_RemoteSocket->DoRecv( &fd );
+						ExtractRemotePackets( );
+						ProcessRemotePackets( );
+
+						if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 && GetTime( ) - m_LastAckTime >= 10 )
+						{
+							m_RemoteSocket->PutBytes( m_GPSProtocol->SEND_GPSC_ACK( m_TotalPacketsReceivedFromRemote ) );
+							m_LastAckTime = GetTime( );
+						}
+
+						m_RemoteSocket->DoSend( &send_fd );
+					}
+				}
+
+				if( m_RemoteSocket->GetConnecting( ) )
+				{
+					// we are currently attempting to connect
+
+					if( m_RemoteSocket->CheckConnect( ) )
+					{
+						// the connection attempt completed
+
+						if( m_GameIsReliable && m_ActionReceived )
+						{
+							// this is a reconnection, not a new connection
+							// if the server accepts the reconnect request it will send a GPS_RECONNECT back requesting a certain number of packets
+
+							SendLocalChat( "GProxy++ reconnected to the server!" );
+							SendLocalChat( "==================================================" );
+							CONSOLE_Print( "[GPROXY] reconnected to remote server" );
+
+							// note: even though we reset the socket when we were disconnected, we haven't been careful to ensure we never queued any data in the meantime
+							// therefore it's possible the socket could have data in the send buffer
+							// this is bad because the server will expect us to send a GPS_RECONNECT message first
+							// so we must clear the send buffer before we continue
+							// note: we aren't losing data here, any important messages that need to be sent have been put in the packet buffer
+							// they will be requested by the server if required
+
+							m_RemoteSocket->ClearSendBuffer( );
+							m_RemoteSocket->PutBytes( m_GPSProtocol->SEND_GPSC_RECONNECT( m_PID, m_ReconnectKey, m_TotalPacketsReceivedFromRemote ) );
+
+							// we cannot permit any forwarding of local packets until the game is synchronized again
+							// this will disable forwarding and will be reset when the synchronization is complete
+
+							m_Synchronized = false;
+						}
+						else
+							CONSOLE_Print( "[GPROXY] connected to remote server" );
+					}
+					else if( GetTime( ) - m_LastConnectionAttemptTime >= 10 )
+					{
+						// the connection attempt timed out (10 seconds)
+
+						CONSOLE_Print( "[GPROXY] connect to remote server timed out" );
+
+						if( m_GameIsReliable && m_ActionReceived && m_ReconnectPort > 0 )
+						{
+							uint32_t TimeRemaining = ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 - ( GetTime( ) - m_LastActionTime );
+
+							if( GetTime( ) - m_LastActionTime > ( m_NumEmptyActions - m_NumEmptyActionsUsed + 1 ) * 60 )
+								TimeRemaining = 0;
+
+							SendLocalChat( "GProxy++ is attempting to reconnect... (" + UTIL_ToString( TimeRemaining ) + " seconds remain)" );
+							CONSOLE_Print( "[GPROXY] attempting to reconnect" );
+							m_RemoteSocket->Reset( );
+							m_RemoteSocket->SetNoDelay( true );
+							m_RemoteSocket->Connect( string( ), m_RemoteServerIP, m_ReconnectPort );
+							m_LastConnectionAttemptTime = GetTime( );
+						}
+						else
+						{
+							m_LocalSocket->Disconnect( );
+							delete m_LocalSocket;
+							m_LocalSocket = NULL;
+							m_RemoteSocket->Reset( );
+							m_RemoteSocket->SetNoDelay( true );
+							m_RemoteServerIP.clear( );
+							m_RemoteServerPort = 0;
+							return false;
+						}
 					}
 				}
 			}
+
+			m_LocalSocket->DoSend( &send_fd );
 		}
-		m_LocalSocket->DoSend( (fd_set *)send_fd );
 	}
-	return false;
+	CTCPSocket *CNewSocket = m_WC3Server->Accept( &fd );
+	if (CNewSocket)
+	{
+		m_Connections.push_back( new CWC3( CNewSocket, m_Server ,6112,m_GIndicator));
+	}
+	for( vector<CWC3 *> ::iterator i = m_Connections.begin( ) ; i != m_Connections.end( ); )
+	{
+		if ((*i)->Update( &fd, &send_fd ) )
+		{
+			delete *i;
+			i = m_Connections.erase( i );
+			CONSOLE_Print("[GPROXY] Deleting connection");
+		}
+		else
+		{
+			i++;
+		}
+	}
+	return m_Exiting;
 }
-void CGPG :: ExtractLocalPackets( )
+
+void CGProxy :: ExtractLocalPackets( )
 {
 	if( !m_LocalSocket )
 		return;
@@ -1585,18 +784,20 @@ void CGPG :: ExtractLocalPackets( )
 			else
 			{
 				CONSOLE_Print( "[GPROXY] received invalid packet from local player (bad length)" );
+				m_Exiting = true;
 				return;
 			}
 		}
 		else
 		{
 			CONSOLE_Print( "[GPROXY] received invalid packet from local player (bad header constant)" );
+			m_Exiting = true;
 			return;
 		}
 	}
 }
 
-void CGPG :: ProcessLocalPackets( )
+void CGProxy :: ProcessLocalPackets( )
 {
 	if( !m_LocalSocket )
 		return;
@@ -1708,7 +909,7 @@ void CGPG :: ProcessLocalPackets( )
 	}
 }
 
-void CGPG :: ExtractRemotePackets( )
+void CGProxy :: ExtractRemotePackets( )
 {
 	string *RecvBuffer = m_RemoteSocket->GetBytes( );
 	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
@@ -1741,18 +942,20 @@ void CGPG :: ExtractRemotePackets( )
 			else
 			{
 				CONSOLE_Print( "[GPROXY] received invalid packet from remote server (bad length)" );
+				m_Exiting = true;
 				return;
 			}
 		}
 		else
 		{
 			CONSOLE_Print( "[GPROXY] received invalid packet from remote server (bad header constant)" );
+			m_Exiting = true;
 			return;
 		}
 	}
 }
 
-void CGPG :: ProcessRemotePackets( )
+void CGProxy :: ProcessRemotePackets( )
 {
 	if( !m_LocalSocket || !m_RemoteSocket )
 		return;
@@ -2032,7 +1235,7 @@ void CGPG :: ProcessRemotePackets( )
 }
 
 
-void CGPG :: SendLocalChat( string message )
+void CGProxy :: SendLocalChat( string message )
 {
     if( m_LocalSocket )
 	{
@@ -2053,7 +1256,7 @@ void CGPG :: SendLocalChat( string message )
 	}
 }
 
-void CGPG :: SendEmptyAction( )
+void CGProxy :: SendEmptyAction( )
 {
 	// we can't send any empty actions while the lag screen is up
 	// so we keep track of who the lag screen is currently showing (if anyone) and we tear it down, send the empty action, and put it back up
@@ -2111,5 +1314,662 @@ void CGPG :: SendEmptyAction( )
 
 
 
+//
+// CIncomingGameHost
+//
+
+uint32_t CIncomingGameHost :: NextUniqueGameID = 1;
+
+CIncomingGameHost :: CIncomingGameHost( uint16_t nGameType, uint16_t nParameter, uint32_t nLanguageID, uint16_t nPort, BYTEARRAY &nIP, uint32_t nStatus, uint32_t nElapsedTime, string nGameName,BYTEARRAY nGamePassword, unsigned char nSlotsTotal,unsigned char nSlotsTotalRAW, uint32_t nHostCounter,BYTEARRAY nHostCounterRAW, BYTEARRAY &nStatString )
+{
+	m_GameType = nGameType;
+	m_Parameter = nParameter;
+	m_LanguageID = nLanguageID;
+	m_Port = nPort;
+	m_IP = nIP;
+	m_Status = nStatus;
+	m_ElapsedTime = nElapsedTime;
+	m_GameName = nGameName;
+	m_SlotsTotal = nSlotsTotal;
+	m_HostCounter = nHostCounter;
+	m_StatString = nStatString;
+	m_UniqueGameID = NextUniqueGameID++;
+	m_ReceivedTime = GetTime( );
+	m_GamePassword = nGamePassword;
+	m_HostCounterRAW = nHostCounterRAW;
+	m_SlotsTotalRAW = nSlotsTotalRAW;
+
+	// decode stat string
+
+	BYTEARRAY StatString = UTIL_DecodeStatString( m_StatString );
+	BYTEARRAY MapFlags;
+	BYTEARRAY MapWidth;
+	BYTEARRAY MapHeight;
+	BYTEARRAY MapCRC;
+	BYTEARRAY MapPath;
+	BYTEARRAY HostName;
+
+	if( StatString.size( ) >= 14 )
+	{
+		unsigned int i = 13;
+		MapFlags = BYTEARRAY( StatString.begin( ), StatString.begin( ) + 4 );
+		MapWidth = BYTEARRAY( StatString.begin( ) + 5, StatString.begin( ) + 7 );
+		MapHeight = BYTEARRAY( StatString.begin( ) + 7, StatString.begin( ) + 9 );
+		MapCRC = BYTEARRAY( StatString.begin( ) + 9, StatString.begin( ) + 13 );
+		MapPath = UTIL_ExtractCString( StatString, 13 );
+		i += MapPath.size( ) + 1;
+
+		m_MapFlags = UTIL_ByteArrayToUInt32( MapFlags, false );
+		m_MapWidth = UTIL_ByteArrayToUInt16( MapWidth, false );
+		m_MapHeight = UTIL_ByteArrayToUInt16( MapHeight, false );
+		m_MapCRC = MapCRC;
+		m_MapPath = string( MapPath.begin( ), MapPath.end( ) );
+
+		if( StatString.size( ) >= i + 1 )
+		{
+			HostName = UTIL_ExtractCString( StatString, i );
+			m_HostName = string( HostName.begin( ), HostName.end( ) );
+		}
+	}
+}
+
+CIncomingGameHost :: ~CIncomingGameHost( )
+{
+
+}
+
+BYTEARRAY CIncomingGameHost :: GetData(string indicator )
+{
+	BYTEARRAY packet;
+	unsigned char ip[] = {127,0,0,1};
+	unsigned char Zero[] = {0,0,0,0};
+	UTIL_AppendByteArray(packet,m_GameType,false);
+	UTIL_AppendByteArray(packet,m_Parameter,false);
+	UTIL_AppendByteArray(packet,m_LanguageID,false);
+	packet.push_back(2);
+	packet.push_back(0);
+	UTIL_AppendByteArray(packet,gGProxy->m_Port,true);
+	UTIL_AppendByteArray(packet,ip,4);
+	UTIL_AppendByteArray(packet,Zero,4);
+	UTIL_AppendByteArray(packet,Zero,4);
+	UTIL_AppendByteArray(packet,m_Status,false);
+	UTIL_AppendByteArray(packet,m_ElapsedTime,false);
+	if (!(m_Status == 17) )
+	{
+		if( m_MapWidth == 1984 && m_MapHeight == 1984 )
+		{
+			string GameName = indicator + m_GameName.substr(0,m_GameName.size( ) - indicator.size( ));
+			UTIL_AppendByteArrayFast(packet,GameName,true);
+		}
+		else
+		{
+			UTIL_AppendByteArrayFast(packet,m_GameName,true);
+		}
+	}
+	else
+	{
+		UTIL_AppendByteArrayFast(packet,m_GameName,true);
+	}
+	string pwd = string(m_GamePassword.begin( ),m_GamePassword.end( ));
+	UTIL_AppendByteArrayFast(packet,pwd);
+	packet.push_back(m_SlotsTotalRAW);
+	UTIL_AppendByteArray(packet,m_HostCounterRAW);
+    string StatString = string(m_StatString.begin( ),m_StatString.end( ));
+	UTIL_AppendByteArrayFast(packet,StatString);
+	return packet;
+}
+string CIncomingGameHost :: GetIPString( )
+{
+	string Result;
+
+	if( m_IP.size( ) >= 4 )
+	{
+		for( unsigned int i = 0; i < 4; i++ )
+		{
+			Result += UTIL_ToString( (unsigned int)m_IP[i] );
+
+			if( i < 3 )
+				Result += ".";
+		}
+	}
+
+	return Result;
+}
 
 
+
+  /////////////////
+ ////  WC3    ////
+/////////////////
+
+CWC3 :: CWC3( CTCPSocket *socket, string hostname,uint16_t port,string indicator)
+{
+	m_LocalSocket = socket;
+	m_LocalSocket->SetNoDelay( true );
+	m_RemoteSocket = new CTCPClient( );
+	m_RemoteSocket->SetNoDelay( true );
+	m_RemoteSocket->Connect( string( ) , hostname, port );
+	CONSOLE_Print("[GPROXY] Initiating the two way connection" );
+	m_GIndicator = indicator;
+	m_FirstPacket = true;
+	m_IsBNFTP = false;
+}
+CWC3 ::~CWC3( )
+{ 
+	delete m_LocalSocket;
+	delete m_RemoteSocket;
+}
+unsigned int CWC3 :: SetFD(void *fd, void *send_fd, int *nfds) 
+{
+	unsigned int NumFDs = 0;
+	if ( !m_LocalSocket->HasError( ) && m_LocalSocket->GetConnected( ) )
+	{
+		m_LocalSocket->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
+		NumFDs++;
+	}
+    if ( !m_RemoteSocket->HasError( ) && m_RemoteSocket->GetConnected( ) )
+	{
+		m_RemoteSocket->SetFD( (fd_set * )fd, (fd_set *)send_fd, nfds );
+		NumFDs++;
+	}
+	return NumFDs;
+}
+
+bool CWC3 :: Update(void *fd, void *send_fd) 
+{
+	// local socket
+	if ( m_LocalSocket->HasError( ) )
+	{
+		CONSOLE_Print("[GPROXY] Local socket disconnected due to socket error");
+		m_RemoteSocket->Disconnect( );
+		return true;
+	}
+	else if( !m_LocalSocket->GetConnected( ) )
+	{
+		CONSOLE_Print("[GPROXY] Local socket disconnected" );
+		m_RemoteSocket->Disconnect( );
+		return true;
+	}
+	else
+	{
+		m_LocalSocket->DoRecv( (fd_set *)fd );
+		ExtractWC3Packets( );
+		ProcessWC3Packets( );
+	}
+
+	// remote socket
+
+	if ( m_RemoteSocket->HasError( ) )
+	{
+		CONSOLE_Print("[GPROXY] Remote socket disconnected due to socket error" );
+		m_LocalSocket->Disconnect( );
+		return true;
+	}
+	else if (!m_RemoteSocket->GetConnected( ) && !m_RemoteSocket->GetConnecting( ) )
+	{
+		CONSOLE_Print("[GPROXY] Remote socket disconnected" );
+	}
+	else if (m_RemoteSocket->GetConnecting( ) )
+	{
+		if (m_RemoteSocket->CheckConnect( ))
+		{
+			CONSOLE_Print("[GPROXY] Remote socket connected with ["+ m_RemoteSocket->GetIPString( ) +"]");
+		}
+	}
+	if ( m_RemoteSocket->GetConnected( ) )
+	{
+		m_RemoteSocket->DoRecv( (fd_set *)fd);
+		ExtractBNETPackets( );
+		ProcessBNETPackets( );
+	}
+
+	m_RemoteSocket->DoSend( (fd_set *) send_fd );
+	m_LocalSocket->DoSend( (fd_set * ) send_fd );
+	return false;
+}
+void CWC3 :: Handle_SID_GETADVLISTEX(BYTEARRAY data)
+{
+	// DEBUG_Print( "RECEIVED SID_GETADVLISTEX" );
+	// DEBUG_Print( data );
+
+	// 2 bytes					-> Header
+	// 2 bytes					-> Length
+	// 4 bytes					-> GamesFound
+	// for( 1 .. GamesFound )
+	//		2 bytes				-> GameType
+	//		2 bytes				-> Parameter
+	//		4 bytes				-> Language ID
+	//		2 bytes				-> AF_INET
+	//		2 bytes				-> Port
+	//		4 bytes				-> IP
+	//		4 bytes				-> zeros
+	//		4 bytes				-> zeros
+	//		4 bytes				-> Status
+	//		4 bytes				-> ElapsedTime
+	//		null term string	-> GameName
+	//		1 byte				-> GamePassword
+	//		1 byte				-> SlotsTotal
+	//		8 bytes				-> HostCounter (ascii hex format)
+	//		null term string	-> StatString
+
+	vector<CIncomingGameHost *> Games;
+	if( ValidateLength( data ) && data.size( ) >= 8 )
+	{
+		unsigned int i = 8;
+		uint32_t GamesFound = UTIL_ByteArrayToUInt32( data, false, 4 );
+		if ( GamesFound == 0 )
+		{
+			BYTEARRAY packet;
+			packet.push_back(255);
+			packet.push_back(SID_GETADVLISTEX);
+			packet.push_back(0);
+			packet.push_back(0);
+			UTIL_AppendByteArray(packet,GamesFound,false);
+			UTIL_AppendByteArray(packet,UTIL_ByteArrayToUInt32(data,false,8),false);
+			AssignLength(packet);
+			m_LocalSocket->PutBytes(packet);
+			return;
+		}
+		while( GamesFound > 0 )
+		{
+			unsigned char ip[] = {127,0,0,1};
+			GamesFound--;
+
+			if( data.size( ) < i + 33 )
+				break;
+			uint16_t GameType = UTIL_ByteArrayToUInt16( data, false, i );
+			i += 2;
+			uint16_t Parameter = UTIL_ByteArrayToUInt16( data, false, i );
+			i += 2;
+			uint32_t LanguageID = UTIL_ByteArrayToUInt32( data, false, i );
+			i += 4;
+			// AF_INET
+			i += 2;
+			uint16_t Port = UTIL_ByteArrayToUInt16( data, true, i );
+			i += 2;
+			BYTEARRAY IP = BYTEARRAY( data.begin( ) + i, data.begin( ) + i + 4 );
+			i += 4;
+			// zeros
+			i += 4;
+			// zeros
+			i += 4;
+			uint32_t Status = UTIL_ByteArrayToUInt32( data, false, i );
+			i += 4;
+			uint32_t ElapsedTime = UTIL_ByteArrayToUInt32( data, false, i );
+			i += 4;
+			BYTEARRAY GameName = UTIL_ExtractCString( data, i );
+			int t = i;
+			i += GameName.size( ) + 1;
+
+			if( data.size( ) < i + 1 )
+				break;
+
+			BYTEARRAY GamePassword = UTIL_ExtractCString( data, i );
+			i += GamePassword.size( ) + 1;
+
+			if( data.size( ) < i + 10 )
+				break;
+
+			// SlotsTotal is in ascii hex format
+
+			unsigned char SlotsTotal = data[i];
+			unsigned int c;
+			stringstream SS;
+			SS << string( 1, SlotsTotal );
+			SS >> hex >> c;
+			i++;
+
+			// HostCounter is in reverse ascii hex format
+			// e.g. 1  is "10000000"
+			// e.g. 10 is "a0000000"
+			// extract it, reverse it, parse it, construct a single uint32_t
+
+			BYTEARRAY HostCounterRaw = BYTEARRAY( data.begin( ) + i, data.begin( ) + i + 8 );
+			string HostCounterString = string( HostCounterRaw.rbegin( ), HostCounterRaw.rend( ) );
+			uint32_t HostCounter = 0;
+
+			for( int j = 0; j < 4; j++ )
+			{
+				unsigned int c;
+				stringstream SS;
+				SS << HostCounterString.substr( j * 2, 2 );
+				SS >> hex >> c;
+				HostCounter |= c << ( 24 - j * 8 );
+			}
+
+			i += 8;
+			BYTEARRAY StatString = UTIL_ExtractCString( data, i );
+			i += StatString.size( ) + 1;
+			CIncomingGameHost *Game = new CIncomingGameHost( GameType, Parameter, LanguageID, Port, IP, Status, ElapsedTime, string( GameName.begin( ), GameName.end( ) ),GamePassword,c, SlotsTotal, HostCounter,HostCounterRaw, StatString );
+			Games.push_back( Game );
+		}
+	}
+	m_Games = Games;
+	gGProxy->m_Games = Games;
+
+	BYTEARRAY packet;
+	packet.push_back(255);
+    packet.push_back(SID_GETADVLISTEX);
+	packet.push_back(0);
+	packet.push_back(0);
+	UTIL_AppendByteArray(packet,(uint32_t)m_Games.size( ),false);
+	for( vector<CIncomingGameHost *> :: iterator i = m_Games.begin( ); i != m_Games.end( ); i++ )
+	{
+		UTIL_AppendByteArray(packet,(*i)->GetData(m_GIndicator ));
+	}
+	AssignLength(packet);
+	m_LocalSocket->PutBytes(packet);
+}
+void CWC3 :: Handle_SID_CHATEVENT(BYTEARRAY data)
+{
+	// DEBUG_Print( "RECEIVED SID_CHATEVENT" );
+	// DEBUG_Print( data );
+
+	// 2 bytes					-> Header
+	// 2 bytes					-> Length
+	// 4 bytes					-> EventID
+	// 4 bytes					-> ???
+	// 4 bytes					-> Ping
+	// 12 bytes					-> ???
+	// null terminated string	-> User
+	// null terminated string	-> Message
+
+	if( ValidateLength( data ) && data.size( ) >= 29 )
+	{
+		BYTEARRAY EventID = BYTEARRAY( data.begin( ) + 4, data.begin( ) + 8 );
+		BYTEARRAY Ping = BYTEARRAY( data.begin( ) + 12, data.begin( ) + 16 );
+		BYTEARRAY Username = UTIL_ExtractCString( data, 28 );
+		BYTEARRAY message = UTIL_ExtractCString( data, Username.size( ) + 29 );
+		string User = string(Username.begin( ),Username.end( ));
+		string Message = string(message.begin( ),message.end( ));
+		switch (UTIL_ByteArrayToUInt32(EventID,false))
+		{
+		case EID_TALK: CONSOLE_Print("[LOCAL] user ["+User+"] said "+ Message); break;
+		case EID_WHISPER: CONSOLE_Print("[WHISPER] user ["+User+"] whispered "+ Message); break;
+		case EID_EMOTE:  CONSOLE_Print("[EMOTE] user ["+User+"] said "+ Message); break;
+		case EID_CHANNEL: CONSOLE_Print("[BNET] joined channel ["+Message+"]"); break;
+		case EID_INFO : CONSOLE_Print("[INFO] "+Message); break;
+		case EID_ERROR: CONSOLE_Print("[ERROR] " +Message); break;
+		}
+	}
+}
+void CWC3 :: Handle_SID_CHATCOMMAND(BYTEARRAY data)
+{
+	if (ValidateLength(data))
+	{
+	    BYTEARRAY msg = UTIL_ExtractCString(data,4);
+		string Message = string(msg.begin( ),msg.end( ));
+		if ( ProcessCommand(Message) )
+		{
+			m_RemoteSocket->PutBytes(data);
+		}
+	}
+}
+bool CWC3 :: ProcessCommand(string Message)
+{
+	string Command;
+	string Payload;
+	string :: size_type PayloadStart = Message.find( " " );
+	if( PayloadStart != string :: npos )
+	{
+		Command = Message.substr( 1, PayloadStart - 1 );
+		Payload = Message.substr( PayloadStart + 1 );
+	}
+	else
+		Command = Message.substr( 1 );
+
+	transform( Command.begin( ), Command.end( ), Command.begin( ), (int(*)(int))tolower );
+
+	bool forward = true; // if forward == true the chatcommand will be sent to bnet
+	if (Command == "version" && Payload.empty( ))
+	{
+		SendLocalChat("GProxy++ Version " + gGProxy->m_Version );
+		forward = false;
+	}
+	else if ((Command == "setindicator" || Command =="si") && !Payload.empty( ))
+	{
+		m_GIndicator = Payload;
+		SendLocalChat("Indicator is now set to "+ Payload );
+		forward = false;
+	}
+	else if (Command == "indicator" )
+	{
+		SendLocalChat("Indicator: "+ m_GIndicator );
+		forward = false;
+	}
+	return forward;
+}
+
+
+
+void CWC3 :: ExtractWC3Packets( )
+{
+	string *RecvBuffer = m_LocalSocket->GetBytes( );
+	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
+	if ( m_FirstPacket )
+	{
+		if( Bytes.size( ) >= 1)
+		{
+			if( Bytes[0] == 1 )
+			{
+					BYTEARRAY packet;
+					packet.push_back(1);
+					m_RemoteSocket->PutBytes(packet);
+					*RecvBuffer = RecvBuffer->substr( 1 );
+					Bytes = BYTEARRAY( Bytes.begin( ) + 1, Bytes.end( ) );
+					CONSOLE_Print("[GPROXY] Connection marked as WC3");
+					m_FirstPacket = false;
+			}
+			if( Bytes[0] == 2 )
+			{
+				CONSOLE_Print("[GPROXY] Connection marked as BNFTP");
+				m_FirstPacket = false;
+				m_IsBNFTP = true;
+			}
+		}
+	}
+	if (m_IsBNFTP)
+	{
+		m_RemoteSocket->PutBytes( Bytes );
+		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
+		return;
+	}
+	 // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
+	while( Bytes.size( ) >= 4 )
+	{
+			// byte 0 is always 255
+            
+			if( Bytes[0] == 255 )
+			{
+					// bytes 2 and 3 contain the length of the packet
+
+					uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
+
+					if( Length >= 4 )
+					{
+							if( Bytes.size( ) >= Length )
+							{
+									BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
+									m_LocalPackets.push( new CCommandPacket( 255,Bytes[1], Data) );
+									*RecvBuffer = RecvBuffer->substr( Length );
+									Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
+							}
+							else
+									return;
+					}
+					else
+					{
+						   CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad length)" );
+							return;
+					}
+			}
+			else
+			{
+					CONSOLE_Print( "[GPROXY] received invalid packet from wc3 (bad header constant)" );
+					return;
+			}
+	}
+}
+void CWC3 :: ProcessWC3Packets( )
+{
+	queue<CCommandPacket *> temp;
+	bool forward = true;
+	while (!m_LocalPackets.empty( ) )
+	{
+		forward = true;
+		CCommandPacket *packet = m_LocalPackets.front( );
+		m_LocalPackets.pop( );
+        switch (packet->GetID( ))
+        {
+             case SID_CHATCOMMAND : Handle_SID_CHATCOMMAND(packet->GetData( )); forward = false; break;
+        }
+        if (forward)
+        {
+			if (m_RemoteSocket->GetConnected( ) )
+			{
+			  m_RemoteSocket->PutBytes(packet->GetData( ));
+			}
+			else
+			{
+				temp.push( packet );
+			}
+        }
+	}
+	m_LocalPackets = temp;
+}
+void CWC3 :: ExtractBNETPackets( )
+{
+	string *RecvBuffer = m_RemoteSocket->GetBytes( );
+	BYTEARRAY Bytes = UTIL_CreateByteArray( (unsigned char *)RecvBuffer->c_str( ), RecvBuffer->size( ) );
+
+	if (m_IsBNFTP)
+	{
+		m_LocalSocket->PutBytes( Bytes );
+		*RecvBuffer = RecvBuffer->substr( Bytes.size( ) );
+		return;
+	}
+    // a packet is at least 4 bytes so loop as long as the buffer contains 4 bytes
+    while( Bytes.size( ) >= 4 )
+    {
+            // byte 0 is always 255
+            
+            if( Bytes[0] == 255 )
+            {
+                    // bytes 2 and 3 contain the length of the packet
+
+                    uint16_t Length = UTIL_ByteArrayToUInt16( Bytes, false, 2 );
+
+                    if( Length >= 4 )
+                    {
+                            if( Bytes.size( ) >= Length )
+                            {
+                                BYTEARRAY Data = BYTEARRAY( Bytes.begin( ), Bytes.begin( ) + Length );
+                                m_RemotePackets.push( new CCommandPacket( 255,Bytes[1], Data) );
+                                *RecvBuffer = RecvBuffer->substr( Length );
+							    Bytes = BYTEARRAY( Bytes.begin( ) + Length, Bytes.end( ) );
+                            }
+                            else
+                                    return;
+                    }
+                    else
+                    {
+                            CONSOLE_Print( "[GPROXY] received invalid packet from bnet (bad length)" );
+                            return;
+                    }
+            }
+            else
+            {
+                    CONSOLE_Print( "[GPROXY] received invalid packet from bnet (bad header constant)" );
+                    return;
+            }
+    }
+}
+
+void CWC3 :: ProcessBNETPackets( )
+{
+    bool forward = true;
+	while ( !m_RemotePackets.empty( ) )
+	{
+		forward = true;
+		CCommandPacket *packet = m_RemotePackets.front( );
+		m_RemotePackets.pop( );
+        switch (packet->GetID( ))
+        {
+           case SID_GETADVLISTEX : Handle_SID_GETADVLISTEX(packet->GetData( )); forward = false; break;
+           case SID_CHATEVENT : Handle_SID_CHATEVENT(packet->GetData( )); break;
+        }
+        if (forward)
+        {
+           m_LocalSocket->PutBytes(packet->GetData( ));
+        }
+		
+	}
+}
+void CWC3 :: SendLocalChat( string message )
+{
+    // send the message from user gproxy as a whisper using the sid_chatevent packet;
+    string user = "GProxy"; // you can change that to whatever you want
+    BYTEARRAY packet;
+    packet.push_back(255);
+    packet.push_back(SID_CHATEVENT);
+    packet.push_back(0);
+    packet.push_back(0);
+    UTIL_AppendByteArray(packet,(uint32_t)EID_WHISPER,false); // event id
+    UTIL_AppendByteArray(packet,(uint32_t)0,false); // user flags
+    UTIL_AppendByteArray(packet,(uint32_t)0,false); // ping
+    UTIL_AppendByteArray(packet,(uint32_t)0,false); // ipaddress 
+    UTIL_AppendByteArray(packet,(uint32_t)0,false); // account number
+    UTIL_AppendByteArray(packet,(uint32_t)0,false); // registration authority
+    UTIL_AppendByteArrayFast(packet,user); // username
+    UTIL_AppendByteArrayFast(packet,message); // message
+    AssignLength(packet);
+    m_LocalSocket->PutBytes(packet);
+}
+
+void CWC3 :: SendChatCommand( string message )
+{
+    BYTEARRAY packet;
+    packet.push_back(255);
+    packet.push_back(SID_CHATCOMMAND);
+    packet.push_back(0);
+    packet.push_back(0);
+    UTIL_AppendByteArrayFast(packet,message);
+    AssignLength(packet);
+    m_RemoteSocket->PutBytes(packet);
+}
+bool CWC3 :: AssignLength( BYTEARRAY &content )
+{
+	// insert the actual length of the content array into bytes 3 and 4 (indices 2 and 3)
+
+	BYTEARRAY LengthBytes;
+
+	if( content.size( ) >= 4 && content.size( ) <= 65535 )
+	{
+		LengthBytes = UTIL_CreateByteArray( (uint16_t)content.size( ), false );
+		content[2] = LengthBytes[0];
+		content[3] = LengthBytes[1];
+		return true;
+	}
+
+	return false;
+}
+
+bool CWC3 :: ValidateLength( BYTEARRAY &content )
+{
+	// verify that bytes 3 and 4 (indices 2 and 3) of the content array describe the length
+
+	uint16_t Length;
+	BYTEARRAY LengthBytes;
+
+	if( content.size( ) >= 4 && content.size( ) <= 65535 )
+	{
+		LengthBytes.push_back( content[2] );
+		LengthBytes.push_back( content[3] );
+		Length = UTIL_ByteArrayToUInt16( LengthBytes, false );
+
+		if( Length == content.size( ) )
+			return true;
+	}
+
+	return false;
+}

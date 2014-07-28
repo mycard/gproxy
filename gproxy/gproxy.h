@@ -57,8 +57,6 @@ uint32_t GetTicks( );		// milliseconds
  #define MILLISLEEP( x ) usleep( ( x ) * 1000 )
 #endif
 
-
-
 // network
 
 #undef FD_SETSIZE
@@ -70,13 +68,6 @@ uint32_t GetTicks( );		// milliseconds
 void CONSOLE_Print( string message);
 void DEBUG_Print(string &message);
 
-// ui forward
-
-class CFwdData;
-
-void forward(CFwdData *data);
-
-
 //
 // CGProxy
 //
@@ -85,30 +76,55 @@ class CTCPServer;
 class CTCPSocket;
 class CTCPClient;
 class CUDPSocket;
+class CBNET;
 class CGameProtocol;
 class CIncomingGameHost;
 class CGPSProtocol;
 class CCommandPacket;
-class CW3CC;
-class CGPG;
-class CProxy;
-class CPotentialSocket;
+class CBNFTPConnection;
+class CWC3;
 
 class CGProxy
 {
 public:
 	string m_Version;
 	CTCPServer *m_LocalServer;
-
+	CTCPSocket *m_LocalSocket;
+	CTCPClient *m_RemoteSocket;
+	vector<CIncomingGameHost *> m_Games;
+	CGameProtocol *m_GameProtocol;
+	CGPSProtocol *m_GPSProtocol;
+	queue<CCommandPacket *> m_LocalPackets;
+	queue<CCommandPacket *> m_RemotePackets;
+	queue<CCommandPacket *> m_PacketBuffer;
+	vector<unsigned char> m_Laggers;
+	uint32_t m_TotalPacketsReceivedFromLocal;
+	uint32_t m_TotalPacketsReceivedFromRemote;
 	bool m_Exiting;
 	string m_Server;
 	uint16_t m_Port;
+	uint32_t m_LastConnectionAttemptTime;
+	uint32_t m_LastRefreshTime;
+	string m_RemoteServerIP;
+	uint16_t m_RemoteServerPort;
+	bool m_GameIsReliable;
+	bool m_GameStarted;
+	bool m_LeaveGameSent;
+	bool m_ActionReceived;
+	bool m_Synchronized;
+	uint16_t m_ReconnectPort;
+	unsigned char m_PID;
+	unsigned char m_ChatPID;
+	uint32_t m_ReconnectKey;
+	unsigned char m_NumEmptyActions;
+	unsigned char m_NumEmptyActionsUsed;
+	uint32_t m_LastAckTime;
+	uint32_t m_LastActionTime;
+	string m_JoinedName;
+	string m_HostName;
 	CTCPServer *m_WC3Server;
-	CTCPServer *m_GameServer;
 	string m_GIndicator;
-	vector<CPotentialSocket *> m_Potentials;
-	CW3CC *m_W3CC;
-	CGPG *m_GPGC;
+	vector<CWC3 *> m_Connections;
 
 	CGProxy(string nServer,uint16_t nPort);
 	~CGProxy( );
@@ -117,6 +133,14 @@ public:
 
 	bool Update( long usecBlock );
 
+	void ExtractLocalPackets( );
+	void ProcessLocalPackets( );
+	void ExtractRemotePackets( );
+	void ProcessRemotePackets( );
+	
+
+	void SendEmptyAction( );
+	void SendLocalChat( string message );
 
 
 };
@@ -184,52 +208,10 @@ public:
 	BYTEARRAY GetGamePassword( )		{ return m_GamePassword; }
 	BYTEARRAY GetHostCounterRAW( )		{ return m_HostCounterRAW;}
 	unsigned char GetSlotsTotalRAW( )   { return m_SlotsTotalRAW;}
-	BYTEARRAY GetData( string indicator,uint16_t port );
+	BYTEARRAY GetData( string indicator );
 };
 
-
-class CProxy
-{
-protected :
-	CTCPSocket *m_LocalSocket;
-	CTCPClient *m_RemoteSocket;
-	queue<BYTEARRAY > m_PacketBuffer;
-	bool m_Exiting;
-	bool m_Dispose;
-	string m_ConsoleSender;
-	string m_RemoteHost;
-	uint16_t m_RemotePort;
-
-	void Print(string message ) { CONSOLE_Print("["+m_ConsoleSender+"] "+ message );}
-	
-
-	virtual void OnLocalDataArrival(  );
-	virtual void OnRemoteDataArrival( );
-	virtual void OnRemoteConnect( );
-
-public:
-	CProxy ( CTCPSocket * socket, string hostname, uint16_t port ,bool connect,string ConsoleSender );
-	CProxy ( CTCPSocket *Local,CTCPClient *Remote );
-	~CProxy( );
-
-	unsigned int SetFD ( void *fd , void * send_fd , int * nfds );
-	bool Update( void * fd, void * send_fd );
-	
-	void SetConsoleSender( string i ) { m_ConsoleSender = i; }
-};
-
-class CPotentialSocket : public CProxy
-{
-private : 
-	CGProxy * m_GProxy;
-
-	virtual void OnLocalDataArrival( );
-public:
-	CPotentialSocket ( CGProxy * m_GProxy, CTCPSocket * socket, string hostname,uint16_t port );
-	~CPotentialSocket( );
-
-};
-class CW3CC : public CProxy
+class CWC3
 {
 private:
 	enum Protocol 
@@ -278,14 +260,15 @@ private:
 
 	};
 
-
-	CGProxy *m_GProxy;
+	CTCPSocket *m_LocalSocket;
+	CTCPClient *m_RemoteSocket;
+	bool m_IsBNFTP;
 	string m_GIndicator;
-	string m_Server;
-
+	bool m_FirstPacket;
 	vector<CIncomingGameHost *> m_Games;
 	queue<CCommandPacket *> m_LocalPackets;
 	queue<CCommandPacket *> m_RemotePackets;
+
 	
 	void ExtractWC3Packets();
 	void ProcessWC3Packets();
@@ -301,73 +284,18 @@ private:
 	void Handle_SID_GETADVLISTEX(BYTEARRAY data);
 	void Handle_SID_CHATEVENT(BYTEARRAY data);
 	void Handle_SID_CHATCOMMAND(BYTEARRAY data);
-	void Handle_SID_NOTIFYJOIN( BYTEARRAY data );
 	bool ProcessCommand(string Command);
 	
 	void SendLocalChat( string message );
 	void SendChatCommand( string message );
 
-	virtual void OnLocalDataArrival( ) { ExtractWC3Packets(  ); ProcessWC3Packets( );}
-	virtual void OnRemoteDataArrival( ) { ExtractBNETPackets( ); ProcessBNETPackets( );}
-
 public:
-	CW3CC( CTCPSocket *socket,CTCPClient *remote,string m_RemoteHost,CGProxy *gproxy,queue<BYTEARRAY> packetbuffer );
-	~CW3CC( );
+	CWC3( CTCPSocket *socket, string hostname,uint16_t port,string indicator);
+	~CWC3( );
+	unsigned int SetFD( void *fd , void *send_fd ,  int *nfds  );
+	bool Update( void *fd , void *send_fd );
 
 	vector<CIncomingGameHost *> GetGames( ) { return m_Games; }
 };
 
-class CGPG
-{
-private:
-	CTCPSocket *m_LocalSocket;
-	CTCPClient *m_RemoteSocket;
-	vector<CIncomingGameHost *> m_Games;
-	CGameProtocol *m_GameProtocol;
-	CGPSProtocol *m_GPSProtocol;
-	queue<CCommandPacket *> m_LocalPackets;
-	queue<CCommandPacket *> m_RemotePackets;
-	queue<CCommandPacket *> m_PacketBuffer;
-	vector<unsigned char> m_Laggers;
-	uint32_t m_TotalPacketsReceivedFromLocal;
-	uint32_t m_TotalPacketsReceivedFromRemote;
-	uint32_t m_LastConnectionAttemptTime;
-	uint32_t m_LastRefreshTime;
-	string m_RemoteServerIP;
-	uint16_t m_RemoteServerPort;
-	bool m_GameIsReliable;
-	bool m_GameStarted;
-	bool m_LeaveGameSent;
-	bool m_ActionReceived;
-	bool m_Synchronized;
-	uint16_t m_ReconnectPort;
-	unsigned char m_PID;
-	unsigned char m_ChatPID;
-	uint32_t m_ReconnectKey;
-	unsigned char m_NumEmptyActions;
-	unsigned char m_NumEmptyActionsUsed;
-	uint32_t m_LastAckTime;
-	uint32_t m_LastActionTime;
-	string m_JoinedName;
-	string m_HostName;
-	string m_GameName;
-
-
-	void ExtractLocalPackets( );
-	void ProcessLocalPackets( );
-	void ExtractRemotePackets( );
-	void ProcessRemotePackets( );
-	
-	void SendEmptyAction( );
-	void SendLocalChat( string message );
-public:
-
-	CGPG( CTCPSocket *socket, vector<CIncomingGameHost *> games );
-	~CGPG( );
-
-	bool Update( void *fd , void *send_fd );
-	unsigned int SetFD( void *fd ,void *send_fd , int *nfds );
-
-	string GetGameName( ) { return m_GameName;}
-};
 #endif
