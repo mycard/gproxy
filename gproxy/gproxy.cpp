@@ -1147,6 +1147,11 @@ void CGProxy :: ProcessRemotePackets( )
 					m_NumEmptyActionsUsed = m_NumEmptyActions;
 				}
 			}
+			else if (Packet->GetID() == CGameProtocol::W3GS_GAMELOADED_OTHERS)
+			{
+				CONSOLE_Print("[GPROXY] game loaded");
+				SwitchToThisWindow(FindWindow("Warcraft III", NULL), true);
+			}
 
 			// forward the data
 
